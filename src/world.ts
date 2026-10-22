@@ -1332,7 +1332,7 @@ export class QQWorld implements World {
     try { sendClock = shortTime(this.config.timezone, new Date((ev.time ?? Date.now() / 1000) * 1000)); } catch (e) { this.log.warn('shortTime FAIL ' + String(e)); }
     const senderTag = `${sender.name}(QQ:${sender.userId})`;
     const channelPrefix = conv.kind === 'group'
-      ? `【QQ群 ${conv.label} ${sendClock}】${senderTag}`
+      ? `【QQ群 ${conv.label}(${conv.id}) ${sendClock}】${senderTag}`
       : `【QQ私聊 ${sendClock} ${senderTag}】`;
     // 把这条消息在 QQ 上的真实身份编号（#message_id）带进上下文：模型据此才能引用/回复
     // 任意一条历史消息（对齐内置 qq world 的 idTag 渲染）。在自己发消息时 qq_send 的返回里
@@ -1357,6 +1357,16 @@ export class QQWorld implements World {
     }
   }
 
+  /**
+   * 聚合后的私聊事件正文：必须自带渠道头，否则模型分不清群聊/私聊，
+   * 会把私聊回复发到上一条群消息所在的群里。
+   */
+  private privateAggregateText(firstAt: number, body: string): string {
+    let clock = '';
+    try { clock = shortTime(this.config.timezone, new Date(firstAt)); } catch { /* 时间格式化失败就不带时刻 */ }
+    return `【QQ私聊 ${clock}】\n${body}`;
+  }
+
   private aggregatePrivate(conv: Conv, sender: QQSenderBrief, text: string, blobs: BlobInput[], meta: Record<string, unknown>): void {
     const host = this.host!;
     const now = Date.now();
@@ -1379,7 +1389,7 @@ export class QQWorld implements World {
         type: 'qq.message',
         ts: eventTs(this.config.timezone, new Date(pend.firstAt)),
         source: SOURCE,
-        text: pend.text,
+        text: this.privateAggregateText(pend.firstAt, pend.text),
         senderKey: conv.address,
         meta: { ...meta, sender: '对话' },
         blobs: undefined,
@@ -1398,7 +1408,7 @@ export class QQWorld implements World {
         type: 'qq.message',
         ts: eventTs(this.config.timezone, new Date(p.firstAt)),
         source: SOURCE,
-        text: p.text,
+        text: this.privateAggregateText(p.firstAt, p.text),
         senderKey: conv.address,
         meta: { ...segMeta, sender: '对话' },
         blobs: undefined,
