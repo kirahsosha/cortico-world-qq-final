@@ -92,6 +92,8 @@ export interface QQWorldConfig {
     dir: string;
     /** 是否在收藏表情包的同时把它加入 QQ 的「收藏表情」（custom face）。需协议端支持 add_custom_face（如 SnowLuma）；不支持时自动降级（仍存盘，但不进 QQ）。开启后 bot 收藏的表情会直接出现在你 QQ 客户端里。 */
     addToQQFavorites: boolean;
+    /** 协议端（NapCat 容器）能读到的共享目录：add_custom_face 只认真实文件路径。 */
+    sharedDir: string;
   };
   /** 主动说话调度器：后台按状态机向监听会话主动冒泡闲聊（事件驱动：只推 nudge，由主模型生成发送，不再用第二模型）。 */
   proactive: {
@@ -300,6 +302,7 @@ export const QQ_DEFAULTS: QQWorldConfig = {
     captureMode: 'sticker',
     dir: '',
     addToQQFavorites: false,
+    sharedDir: '/shared',
   },
   proactive: {
     enabled: false,
@@ -470,6 +473,7 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
         'x-hot': false,
         description: 'sticker=仅 OneBot 表情包段；allImages=所有图片都当表情候选收藏。',
       },
+      'worlds.qqbot.sticker.sharedDir': { type: 'string', title: '共享目录', 'x-hot': true, description: 'NapCat 容器也挂载了的目录（两侧路径要一致，默认 /shared）。add_custom_face 只接受真实文件路径，图片会先落到这里再把路径交给协议端。' },
       'worlds.qqbot.sticker.addToQQFavorites': { type: 'boolean', title: '同步到 QQ 收藏表情', 'x-hot': true, description: '开启后，bot 每收藏一张表情包都会同时加入登录账号的 QQ「收藏表情」（custom face），你能在 QQ 客户端里直接看到/使用。依赖协议端支持 add_custom_face（如 SnowLuma）；不支持时自动降级（仍存盘，但不进 QQ）。注意 QQ 收藏表情有数量上限，超出会失败（可用 qq_sticker_to_favorites 的结果看到哪些没加进去）。' },
       'worlds.qqbot.proactive.enabled': { type: 'boolean', title: '主动说话调度器', 'x-hot': false, description: '开启后后台按状态机向监听会话主动冒泡闲聊（移植自 fat-fish ProactiveSpeaker）。' },
       'worlds.qqbot.proactive.mode': {
@@ -662,6 +666,7 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   if (c.sticker.captureMode !== 'sticker' && c.sticker.captureMode !== 'allImages') c.sticker.captureMode = 'sticker';
   if (typeof c.sticker.dir !== 'string') c.sticker.dir = '';
   if (typeof c.sticker.addToQQFavorites !== 'boolean') c.sticker.addToQQFavorites = false;
+  if (typeof c.sticker.sharedDir !== 'string' || !c.sticker.sharedDir.trim()) c.sticker.sharedDir = QQ_DEFAULTS.sticker.sharedDir;
   // proactive 子对象原地合并
   c.proactive = c.proactive ?? {};
   Object.assign(c.proactive, { ...QQ_DEFAULTS.proactive, ...(c.proactive as object) });

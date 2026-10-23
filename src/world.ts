@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, readdirSync, openSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, openSync, mkdirSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { type BlobInput, type EventEnvelope, type Language, type Logger, type PromptDocDecl, type ToolDef, type ToolSpec, type World, type WorldWebUiDecl, type WorldHost, type WorldLamp, type WorldPanelDecl, type WorldStreamSocket } from 'cortico/core/types.ts';
@@ -942,9 +942,20 @@ export class QQWorld implements World {
   private async pushStickerToQQFavorites(bytes: Uint8Array, ext: string): Promise<string | null> {
     if (!this.config.sticker.addToQQFavorites) return null;
     if (!this.driver) return null;
-    const base64 = Buffer.from(bytes).toString('base64');
+    // NapCat 的 add_custom_face 只认本地文件路径（stat + readFile + emojiPath 都是路径），
+    // `base64://` 会被当成路径去 stat 而报 ENAMETOOLONG。所以先落到共享目录再传路径。
+    const dir = (this.config.sticker.sharedDir || '/shared').replace(/[\\/]+$/, '');
+    const extName = (ext || 'png').replace(/^\./, '') || 'png';
+    const file = `${dir}/sticker-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}.${extName}`;
     try {
-      const res = (await this.driver.callApi('add_custom_face', { file: `base64://${base64}` })) as
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(file, bytes);
+    } catch (e) {
+      this.log.warn('写入共享目录失败，跳过同步到 QQ 收藏表情', { dir, err: String(e) });
+      return null;
+    }
+    try {
+      const res = (await this.driver.callApi('add_custom_face', { file })) as
         | { emoji_id?: string; data?: { emoji_id?: string } }
         | undefined;
       const eid = res?.emoji_id ?? res?.data?.emoji_id ?? null;
@@ -952,7 +963,7 @@ export class QQWorld implements World {
       else this.log.warn('add_custom_face 未返回 emoji_id', { res });
       return eid ?? null;
     } catch (e) {
-      this.log.warn('加入 QQ 收藏表情失败（协议端可能不支持 add_custom_face，或 QQ 收藏表情已达上限）', { err: String(e), ext });
+      this.log.warn('加入 QQ 收藏表情失败（协议端可能不支持 add_custom_face、共享目录没挂载，或已达上限）', { err: String(e), file });
       return null;
     }
   }
@@ -2813,6 +2824,7 @@ export class QQWorld implements World {
       { id: 'proactive', title: '主动说话', description: '后台按状态机向监听会话主动冒泡闲聊（移植自 fat-fish ProactiveSpeaker）。', group: 'world:qqbot', prefix: 'worlds.qqbot.proactive.', topOnly: false },
       { id: 'qzone', title: 'QQ空间', description: 'QQ 空间动态发布、自动冒泡与评论回复。', group: 'world:qqbot', prefix: 'worlds.qqbot.qzone.', topOnly: false },
       { id: 'group-speak', title: '群聊限速', description: '限制每个群在单位窗口内被 bot 发出的消息总量，防刷屏/死循环。', group: 'world:qqbot', prefix: 'worlds.qqbot.groupSpeak.', topOnly: false },
+      { id: 'listen', title: '群消息采样', description: '不是每条群消息都推给模型：被 @ 或私聊永远推，其余按概率抽样，省调用也更像活人。', group: 'world:qqbot', prefix: 'worlds.qqbot.listen.', topOnly: false },
       { id: 'anti-loop', title: '防刷/话题结束', description: '统计单会话 bot 连续发言次数与对方静默时长，超限自动收尾。', group: 'world:qqbot', prefix: 'worlds.qqbot.antiLoop.', topOnly: false },
       { id: 'routine', title: '作息功能', description: '按真实时间切换睡眠/午休/活跃状态，到点播报。', group: 'world:qqbot', prefix: 'worlds.qqbot.routine.', topOnly: false },
       { id: 'reminder', title: '到点提醒', description: '记下的定时提醒到点自动发到对应会话。', group: 'world:qqbot', prefix: 'worlds.qqbot.reminder.', topOnly: false },
