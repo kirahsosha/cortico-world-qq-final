@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, readdirSync, openSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, openSync, mkdirSync, statSync, unlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { type BlobInput, type EventEnvelope, type Language, type Logger, type PromptDocDecl, type ToolDef, type ToolSpec, type World, type WorldWebUiDecl, type WorldHost, type WorldLamp, type WorldPanelDecl, type WorldStreamSocket } from 'cortico/core/types.ts';
@@ -939,6 +939,20 @@ export class QQWorld implements World {
    * 把一张表情图加入 QQ 的「收藏表情」（custom face）。需协议端支持 add_custom_face（如 SnowLuma）。
    * 用 base64:// 直传，避免依赖协议端进程读取本机磁盘路径。返回 emoji_id 或 null（失败/未开启/无驱动）。
    */
+  /** 顺手清掉共享目录里过期的表情临时文件，避免无限增长。 */
+  private pruneSharedDir(dir: string, days: number): void {
+    try {
+      const cut = Date.now() - days * 86400_000;
+      for (const name of readdirSync(dir)) {
+        if (!name.startsWith('sticker-')) continue;
+        const p = `${dir}/${name}`;
+        try {
+          if (statSync(p).mtimeMs < cut) unlinkSync(p);
+        } catch { /* 单个文件失败忽略 */ }
+      }
+    } catch { /* 目录不存在等，忽略 */ }
+  }
+
   private async pushStickerToQQFavorites(bytes: Uint8Array, ext: string): Promise<string | null> {
     if (!this.config.sticker.addToQQFavorites) return null;
     if (!this.driver) return null;
@@ -954,14 +968,25 @@ export class QQWorld implements World {
       this.log.warn('写入共享目录失败，跳过同步到 QQ 收藏表情', { dir, err: String(e) });
       return null;
     }
+    this.pruneSharedDir(dir, 7);
     try {
       const res = (await this.driver.callApi('add_custom_face', { file })) as
         | { emoji_id?: string; data?: { emoji_id?: string } }
         | undefined;
       const eid = res?.emoji_id ?? res?.data?.emoji_id ?? null;
-      if (eid) this.log.info('已加入 QQ 收藏表情', { emojiId: eid, ext });
-      else this.log.warn('add_custom_face 未返回 emoji_id', { res });
-      return eid ?? null;
+      if (eid) {
+        this.log.info('已加入 QQ 收藏表情', { emojiId: eid, ext });
+        return eid;
+      }
+      // NapCat 的返回是 { result: 0, errMsg: '', isExist: 0 }，没有 emoji_id；
+      // result 0 就是成功，别因为缺 id 报 WARN。
+      const result = (res as { result?: unknown } | undefined)?.result;
+      if (result === 0 || result === '0') {
+        this.log.info('已加入 QQ 收藏表情（协议端未返回 id）', { file });
+        return null;
+      }
+      this.log.warn('add_custom_face 未返回 emoji_id', { res });
+      return null;
     } catch (e) {
       this.log.warn('加入 QQ 收藏表情失败（协议端可能不支持 add_custom_face、共享目录没挂载，或已达上限）', { err: String(e), file });
       return null;
