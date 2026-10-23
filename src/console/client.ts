@@ -32,6 +32,7 @@ const MODULES: ModuleSpec[] = [
   { id: 'proactive', title: '主动说话', desc: '后台按状态机向监听会话主动冒泡闲聊。', group: 'world:qqbot', prefix: 'worlds.qqbot.proactive.', topOnly: false },
   { id: 'qzone', title: 'QQ空间', desc: 'QQ 空间动态发布、自动冒泡与评论回复。', group: 'world:qqbot', prefix: 'worlds.qqbot.qzone.', topOnly: false },
   { id: 'group-speak', title: '群聊限速', desc: '限制每个群单位窗口内 bot 发出的消息总量。', group: 'world:qqbot', prefix: 'worlds.qqbot.groupSpeak.', topOnly: false },
+  { id: 'listen', title: '群消息采样', desc: '不是每条群消息都推给模型：被 @ 或私聊永远推，其余按概率抽样，省调用也更像活人。', group: 'world:qqbot', prefix: 'worlds.qqbot.listen.', topOnly: false },
   { id: 'anti-loop', title: '防刷/话题结束', desc: '统计连续发言与静默时长，超限自动收尾。', group: 'world:qqbot', prefix: 'worlds.qqbot.antiLoop.', topOnly: false },
   { id: 'routine', title: '作息功能', desc: '睡眠/午休/活跃作息，到点播报。', group: 'world:qqbot', prefix: 'worlds.qqbot.routine.', topOnly: false },
   { id: 'reminder', title: '到点提醒', desc: '定时提醒到点自动发到对应会话。', group: 'world:qqbot', prefix: 'worlds.qqbot.reminder.', topOnly: false },
