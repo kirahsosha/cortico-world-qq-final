@@ -121,6 +121,13 @@ export interface QQWorldConfig {
     /** 滑动窗口长度（秒）。 */
     windowSec: number;
   };
+  /** 群消息采样：不是每条群消息都推给模型——省调用，也让"偶尔接一句"更自然。 */
+  listen: {
+    /** 采样概率 0..1：1=每条都推，0=除被 @ 外都不推。 */
+    sampleRate: number;
+    /** 同一个群里两次抽样推送的最小间隔（秒），0=不限制。 */
+    cooldownSec: number;
+  };
   /** 话题自动结束 / 防死循环：统计单会话内 bot 连续发言次数，超过阈值或对方长时间未接话则自动收尾。 */
   antiLoop: {
     /** 是否启用防死循环。 */
@@ -328,6 +335,10 @@ export const QQ_DEFAULTS: QQWorldConfig = {
     maxPerWindow: 12,
     windowSec: 60,
   },
+  listen: {
+    sampleRate: 0.3,
+    cooldownSec: 90,
+  },
   antiLoop: {
     enabled: true,
     maxConsecutiveBotTurns: 5,
@@ -479,6 +490,8 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
       'worlds.qqbot.groupSpeak.enabled': { type: 'boolean', title: '群聊发言限速', 'x-hot': true, description: '开启后限制每个群在单位窗口内被 bot 发出的消息总量，防止刷屏/死循环灌水。' },
       'worlds.qqbot.groupSpeak.maxPerWindow': { type: 'integer', title: '窗口内最大条数', minimum: 1, maximum: 200, 'x-hot': true, description: '滑动窗口内允许发出的群消息上限（含主动与回复）。' },
       'worlds.qqbot.groupSpeak.windowSec': { type: 'integer', title: '窗口长度(秒)', minimum: 1, maximum: 3600, 'x-hot': true, description: '限速滑动窗口长度。' },
+      'worlds.qqbot.listen.sampleRate': { type: 'number', title: '群消息采样率', minimum: 0, maximum: 1, multipleOf: 0.05, 'x-hot': true, description: '不是每条群消息都推给模型：被 @ 或私聊永远推；其余按此概率抽样。1=全推，0.3=大约三条挑一条，0=只在被 @ 时推。降低它同时减少模型调用和话痨感。' },
+      'worlds.qqbot.listen.cooldownSec': { type: 'integer', title: '采样冷却(秒)', minimum: 0, maximum: 3600, 'x-hot': true, description: '同一个群里两次抽样推送的最小间隔；0=不限制。防止热闹的群把采样额度用光。' },
       'worlds.qqbot.antiLoop.enabled': { type: 'boolean', title: '话题自动结束', 'x-hot': true, description: '开启后统计单会话 bot 连续发言次数与对方静默时长，超限自动收尾，避免话题死循环。' },
       'worlds.qqbot.antiLoop.maxConsecutiveBotTurns': { type: 'integer', title: '连续发言上限', minimum: 1, maximum: 50, 'x-hot': true, description: '单会话内 bot 连续发言达到该次数（对方发消息即清零），下次发言被拦截并提示收尾。' },
       'worlds.qqbot.antiLoop.idleToEndSec': { type: 'integer', title: '对方静默收尾(秒)', minimum: 0, maximum: 86400, 'x-hot': true, description: '对方静默超过该秒数且 bot 已发过言则自动收尾；0=关闭该规则。' },
@@ -689,6 +702,12 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   if (typeof gs.enabled !== 'boolean') gs.enabled = true;
   if (typeof gs.maxPerWindow !== 'number' || (gs.maxPerWindow as number) < 1) gs.maxPerWindow = QQ_DEFAULTS.groupSpeak.maxPerWindow;
   if (typeof gs.windowSec !== 'number' || (gs.windowSec as number) < 1) gs.windowSec = QQ_DEFAULTS.groupSpeak.windowSec;
+  c.listen = c.listen ?? {};
+  Object.assign(c.listen, { ...QQ_DEFAULTS.listen, ...(c.listen as object) });
+  const ls = c.listen as Record<string, unknown>;
+  if (typeof ls.sampleRate !== 'number' || (ls.sampleRate as number) < 0) ls.sampleRate = QQ_DEFAULTS.listen.sampleRate;
+  if ((ls.sampleRate as number) > 1) ls.sampleRate = 1;
+  if (typeof ls.cooldownSec !== 'number' || (ls.cooldownSec as number) < 0) ls.cooldownSec = QQ_DEFAULTS.listen.cooldownSec;
   c.antiLoop = c.antiLoop ?? {};
   Object.assign(c.antiLoop, { ...QQ_DEFAULTS.antiLoop, ...(c.antiLoop as object) });
   const al = c.antiLoop as Record<string, unknown>;

@@ -1338,6 +1338,10 @@ export class QQWorld implements World {
     // 任意一条历史消息（对齐内置 qq world 的 idTag 渲染）。在自己发消息时 qq_send 的返回里
     // 也会给 message_id，这里补上入站消息，使「引用消息」功能完整闭环。
     const idTag = ev.message_id != null ? `#${ev.message_id} ` : '';
+    if (!this.shouldPushEvent(conv.kind, conv.address, atMe)) {
+      this.log.info('群消息采样：本条不推给模型', { conv: conv.address });
+      return;
+    }
     this.log.info('HANDLE_PUSH pre kind=' + conv.kind);
     // 记录"应当回复"的会话，供回合收束时兜底自动发送（模型若只输出文本未调 qq_send）。
     if (conv.kind === 'private' || atMe) this._pendingReplyConvs.add(conv.address);
@@ -1693,6 +1697,26 @@ export class QQWorld implements World {
     }
     return null;
   }
+  /** 群消息采样：会话地址 -> 上次抽样推送的时间。 */
+  private lastSampledPush = new Map<string, number>();
+
+  /**
+   * 这条消息要不要推给模型。私聊与被 @ 永远推；群里其它消息按 listen.sampleRate 抽样，
+   * 并受 listen.cooldownSec 冷却——否则热闹的群会把采样额度一次用光。
+   */
+  private shouldPushEvent(kind: string, address: string, atMe: boolean): boolean {
+    if (kind !== 'group' || atMe) return true;
+    const l = this.config.listen;
+    if (!l || l.sampleRate >= 1) return true;
+    if (l.sampleRate <= 0) return false;
+    const now = Date.now();
+    const last = this.lastSampledPush.get(address) ?? 0;
+    if (l.cooldownSec > 0 && now - last < l.cooldownSec * 1000) return false;
+    if (Math.random() > l.sampleRate) return false;
+    this.lastSampledPush.set(address, now);
+    return true;
+  }
+
   private recordGroupSpeak(address: string): void {
     if (!this.config.groupSpeak.enabled || !address.startsWith('group:')) return;
     const stamps = this.groupSpeakStamps.get(address) ?? [];
