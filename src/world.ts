@@ -1378,6 +1378,14 @@ export class QQWorld implements World {
       this.log.info('群消息采样：本条不推给模型', { conv: conv.address });
       return;
     }
+    // 给桌面世界留个来源标记：桌面工具只认「主人私聊」或「非 QQ（本机）」。
+    // 同进程，另一个 World 读 globalThis 即可；带时间戳，过期就不算数。
+    (globalThis as unknown as Record<string, unknown>).__cuaOrigin = {
+      kind: conv.kind,
+      conv: conv.address,
+      user: String(sender.userId ?? ''),
+      ts: Date.now(),
+    };
     this.log.info('HANDLE_PUSH pre kind=' + conv.kind);
     // 记录"应当回复"的会话，供回合收束时兜底自动发送（模型若只输出文本未调 qq_send）。
     if (conv.kind === 'private' || atMe) this._pendingReplyConvs.add(conv.address);
