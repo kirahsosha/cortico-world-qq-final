@@ -538,67 +538,6 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
 
   /** 语音收发配置分组：收语音转文字、发语音，两种实现可切。路径/模型均不写死，由下方各字段或环境变量决定。 */
   /** 群消息要不要推给模型：点名词 + 自定义脚本。 */
-export const QQ_PUSH_GROUP: ConfigGroup = {
-  id: 'world:qqbot-push',
-  owner: 'world:qqbot-push',
-  schema: {
-    type: 'object',
-    title: 'QQ · 群消息推送',
-    description: '决定哪些群消息会被交给模型（之后回不回由提示词里的规则和模型判断）。改完即时生效。',
-    properties: {
-      'worlds.qqbot.botAliases': {
-        type: 'string',
-        title: '点名识别词（逗号分隔）',
-        'x-hot': true,
-        description: '群里正文命中这些词就当作被 @：必定推给模型。留空则只用账号昵称匹配。例：鲸鲸,大肥鱼,肥鱼',
-      },
-      'worlds.qqbot.groupSpeak.sampleRate': {
-        type: 'number',
-        title: '群消息采样率',
-        minimum: 0,
-        maximum: 1,
-        multipleOf: 0.05,
-        'x-hot': true,
-        description: '不是每条群消息都推给模型：被 @、点名、脚本放行的必推；其余按此概率抽样。1=全推，0.3=约三条挑一条，0=只在被 @ 时推。',
-      },
-      'worlds.qqbot.groupSpeak.cooldownSec': {
-        type: 'integer',
-        title: '采样冷却（秒）',
-        minimum: 0,
-        maximum: 3600,
-        'x-hot': true,
-        description: '同一群里两次抽样推送的最小间隔；0=不限制。',
-      },
-      'worlds.qqbot.groupSpeak.botAliases': {
-        type: 'string',
-        title: '点名识别词（逗号分隔）',
-        'x-hot': true,
-        description: '群里正文命中这些词就当作被 @，必定推给模型。留空则只用账号昵称匹配。例：鲸鲸,大肥鱼,肥鱼',
-      },
-      'worlds.qqbot.groupSpeak.pushRuleScript': {
-        type: 'string',
-        title: '推送判定脚本（JS，返回 true 才推）',
-        'x-hot': true,
-        description: '留空 = 内置逻辑。可用变量：text、kind、senderId、atMe、nameHit、sampleRate、cooldownSec、lastAgoMs、rand。报错自动回退内置逻辑（脚本跑在 Core 进程里，等同管理员权限）。',
-      },
-      'worlds.qqbot.pushRuleScript': {
-        type: 'string',
-        title: '推送判定脚本（JS）',
-        'x-hot': true,
-        description: '留空 = 内置逻辑（@ 与点名必推，其余按采样率+冷却）。填了则完全由脚本决定，必须 return true/false。可用变量见默认脚本注释。',
-        default: `// 返回 true = 这条消息推给模型（再由模型决定回不回）
-// 可用变量：text 正文 / kind 'group'|'private' / senderId QQ号 / atMe 被@
-//           nameHit 命中点名词 / sampleRate 采样率 / cooldownSec 冷却秒
-//           lastAgoMs 距上次同群推送的毫秒 / rand 0~1 随机数
-if (kind !== 'group' || atMe || nameHit) return true;
-if (sampleRate <= 0) return false;
-if (cooldownSec > 0 && lastAgoMs < cooldownSec * 1000) return false;
-return rand <= sampleRate;`,
-      },
-    },
-  },
-};
-
 /** 「!dsh <任务>」免模型通道的额度与白名单。 */
 export const QQ_DSH_GROUP: ConfigGroup = {
   id: 'world:qqbot-dsh',
