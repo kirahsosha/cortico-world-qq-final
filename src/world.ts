@@ -6,7 +6,7 @@ import { type BlobInput, type EventEnvelope, type Language, type Logger, type Pr
 import { shortTime } from 'cortico/core/util.ts';
 import { OneBotDriver } from './driver.ts';
 import { QZonePoster, type QZoneConfig } from './qzone.ts';
-import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DSH_GROUP, QQ_PUSH_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
+import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DSH_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
 import { transcribeRecord, synthesizeVoice, judgeVoiceWish, checkVoiceDeps, voiceReady, splitIntoSentences, type RuntimeVoiceCfg } from './voice.ts';
 import { isAbsolute, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1365,7 +1365,7 @@ export class QQWorld implements World {
     const configured = (this.config as unknown as { botAliases?: unknown }).botAliases;
     if (Array.isArray(configured)) for (const a of configured) pushAlias(a);
     // 点名词来自配置（逗号/空格分隔），留空则只靠昵称
-    const aliasCfg = (this.config as unknown as { botAliases?: unknown }).botAliases;
+    const aliasCfg = (this.config.groupSpeak as unknown as { botAliases?: unknown }).botAliases;
     if (Array.isArray(aliasCfg)) for (const a of aliasCfg) pushAlias(a);
     else if (typeof aliasCfg === 'string') for (const a of aliasCfg.split(/[\s,，、]+/)) pushAlias(a);
     const nameHit = plainText.length > 0 && aliases.some((a) => plainText.includes(a));
@@ -1930,13 +1930,14 @@ export class QQWorld implements World {
    */
   private shouldPushEvent(kind: string, address: string, atMe: boolean, nameHit = false, text = ''): boolean {
     const l = this.config.listen;
-    const sampleRate = l?.sampleRate ?? 1;
-    const cooldownSec = l?.cooldownSec ?? 0;
+    const gsRate = this.config.groupSpeak as unknown as { sampleRate?: number; cooldownSec?: number };
+    const sampleRate = gsRate.sampleRate ?? 1;
+    const cooldownSec = gsRate.cooldownSec ?? 0;
     const now = Date.now();
     const last = this.lastSampledPush.get(address) ?? 0;
     const rand = Math.random();
 
-    const src = String((this.config as unknown as { pushRuleScript?: unknown }).pushRuleScript ?? '').trim();
+    const src = String((this.config.groupSpeak as unknown as { pushRuleScript?: unknown }).pushRuleScript ?? '').trim();
     if (src) {
       try {
         if (!this.pushRule || this.pushRule.src !== src) {
@@ -3051,7 +3052,7 @@ export class QQWorld implements World {
       { id: 'sticker', title: '表情包', description: '自动收藏表情包：下载消息里的图片并标注情感/用处。', group: 'world:qqbot', prefix: 'worlds.qqbot.sticker.', topOnly: false },
       { id: 'proactive', title: '主动说话', description: '后台按状态机向监听会话主动冒泡闲聊（移植自 fat-fish ProactiveSpeaker）。', group: 'world:qqbot', prefix: 'worlds.qqbot.proactive.', topOnly: false },
       { id: 'qzone', title: 'QQ空间', description: 'QQ 空间动态发布、自动冒泡与评论回复。', group: 'world:qqbot', prefix: 'worlds.qqbot.qzone.', topOnly: false },
-      { id: 'group-speak', title: '群聊限速', description: '一个页面管全：说多少（限速）、哪些消息进来（采样/点名/脚本）。改完即时生效。', group: 'world:qqbot-push', prefix: 'worlds.qqbot.', topOnly: false },
+      { id: 'group-speak', title: '群聊限速', description: '群消息进不进来（采样/点名/脚本）与 bot 说多少（限速）。改完即时生效。', group: 'world:qqbot', prefix: 'worlds.qqbot.groupSpeak.', topOnly: false },
       { id: 'anti-loop', title: '防刷/话题结束', description: '统计单会话 bot 连续发言次数与对方静默时长，超限自动收尾。', group: 'world:qqbot', prefix: 'worlds.qqbot.antiLoop.', topOnly: false },
       { id: 'routine', title: '作息功能', description: '按真实时间切换睡眠/午休/活跃状态，到点播报。', group: 'world:qqbot', prefix: 'worlds.qqbot.routine.', topOnly: false },
       { id: 'reminder', title: '到点提醒', description: '记下的定时提醒到点自动发到对应会话。', group: 'world:qqbot', prefix: 'worlds.qqbot.reminder.', topOnly: false },
@@ -3117,7 +3118,7 @@ export class QQWorld implements World {
         },
       ],
       links: [],
-      config: [QQ_CONFIG_GROUP, QQ_DSH_GROUP, QQ_PUSH_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP],
+      config: [QQ_CONFIG_GROUP, QQ_DSH_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP],
     };
   }
 
@@ -3221,7 +3222,6 @@ export class QQWorld implements World {
     const map: Record<string, any> = {
       'world:qqbot': QQ_CONFIG_GROUP,
       'world:qqbot-dsh': QQ_DSH_GROUP,
-      'world:qqbot-push': QQ_PUSH_GROUP,
       'world:qqbot-voice': QQ_VOICE_GROUP,
       'world:qqbot-asr': QQ_ASR_GROUP,
     };
