@@ -6,7 +6,7 @@ import { type BlobInput, type EventEnvelope, type Language, type Logger, type Pr
 import { shortTime } from 'cortico/core/util.ts';
 import { OneBotDriver } from './driver.ts';
 import { QZonePoster, type QZoneConfig } from './qzone.ts';
-import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
+import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DSH_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
 import { transcribeRecord, synthesizeVoice, judgeVoiceWish, checkVoiceDeps, voiceReady, splitIntoSentences, type RuntimeVoiceCfg } from './voice.ts';
 import { isAbsolute, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -3079,7 +3079,7 @@ export class QQWorld implements World {
         },
       ],
       links: [],
-      config: [QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP],
+      config: [QQ_CONFIG_GROUP, QQ_DSH_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP],
     };
   }
 
@@ -3182,6 +3182,7 @@ export class QQWorld implements World {
   private configGroupById(id: string): { schema?: { title?: string; properties?: Record<string, any> } } | undefined {
     const map: Record<string, any> = {
       'world:qqbot': QQ_CONFIG_GROUP,
+      'world:qqbot-dsh': QQ_DSH_GROUP,
       'world:qqbot-voice': QQ_VOICE_GROUP,
       'world:qqbot-asr': QQ_ASR_GROUP,
     };

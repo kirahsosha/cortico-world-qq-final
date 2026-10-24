@@ -525,7 +525,34 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
   };
 
   /** 语音收发配置分组：收语音转文字、发语音，两种实现可切。路径/模型均不写死，由下方各字段或环境变量决定。 */
-  export const QQ_VOICE_GROUP: ConfigGroup = {
+  /** 「!dsh <任务>」免模型通道的额度与白名单。 */
+export const QQ_DSH_GROUP: ConfigGroup = {
+  id: 'world:qqbot-dsh',
+  owner: 'world:qqbot-dsh',
+  schema: {
+    type: 'object',
+    title: 'QQ · DSH 桥接',
+    description: '「!dsh <任务>」免模型通道：额度与白名单。改完即时生效，无需重启。',
+    properties: {
+      'worlds.qqbot.dshQuotaPerDay': {
+        type: 'integer',
+        title: 'DSH 每日条数上限',
+        minimum: 0,
+        maximum: 500,
+        'x-hot': true,
+        description: '每天最多跑几条；0 = 不限制。超限直接回「今天的 DSH 额度用完了（N/N），明天再来」。',
+      },
+      'worlds.qqbot.dshAllowedUsers': {
+        type: 'string',
+        title: 'DSH 白名单（QQ 号）',
+        'x-hot': true,
+        description: '允许用「!dsh」的 QQ 号，逗号分隔（如 344380045,2961227626）。留空则用内置的两个主人号。',
+      },
+    },
+  },
+};
+
+export const QQ_VOICE_GROUP: ConfigGroup = {
   id: 'world:qqbot-voice',
   owner: 'world:qqbot',
   schema: {
