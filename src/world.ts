@@ -3109,6 +3109,7 @@ export class QQWorld implements World {
             { name: 'qq.activeGroups', description: '正在监听的群列表。', multiline: true },
             { name: 'qq.activePrivates', description: '正在监听的私聊列表。', multiline: true },
             { name: 'qq.unread', description: '未读摘要。' },
+            { name: 'qq.memberBrief', description: '群友档案速查：发言量靠前的人及其口头禅，供参考、不必刻意提起。', multiline: true },
             { name: 'qq.now', description: '当前时间（时区见配置），用于回答"现在几点/星期几/几号"等问题。' },
             { name: 'qq.festival', description: '今天是什么日子：公历/农历节日、二十四节气（按配置时区推算），用于让主动说话自然呼应今天；可能为空（平日无节日）。', multiline: true },
             { name: 'qq.voice', description: '语音能力说明：对方明确要求语音时回复会被转成语音消息，且那正是你自己说的，别误认成对方发的、也别以为没发出去。', multiline: true },
@@ -3353,6 +3354,7 @@ export class QQWorld implements World {
       'qq.activeGroups': groupLines,
       'qq.activePrivates': privLines,
       'qq.unread': this.unreadSummary(),
+      'qq.memberBrief': this.memberBrief(),
       'qq.now': `当前时间：${nowStr}（时区 ${this.config.timezone}）。若用户问「现在几点」「今天星期几」「几号了」等，据此回答，不要乱编。`,
       'qq.festival': festivalLine,
       'qq.qzone': qzoneLine,
@@ -3361,6 +3363,38 @@ export class QQWorld implements World {
       'qq.routine': this.routineSegmentText(),
       'qq.voice': voiceLine,
     };
+  }
+
+  /** 群友档案速查：读 /data/members/index.json + 每人档案，拼成 ≤800 字。 */
+  private memberBriefCache: { key: string; text: string } | null = null;
+  private memberBriefLogged = false;
+  private memberBrief(): string {
+    try {
+      const dir = '/data/home/companion/data/members';
+      const idx = JSON.parse(readFileSync(`${dir}/index.json`, 'utf8')) as Array<{ qq?: string; name: string; msgs: number }>;
+      if (!Array.isArray(idx) || !idx.length) return '';
+      const key = `${idx.length}:${idx[0]?.msgs ?? 0}`;
+      if (this.memberBriefCache && this.memberBriefCache.key === key) return this.memberBriefCache.text;
+
+      const lines = idx.slice(0, 8).map((m) => {
+        try {
+          const p = JSON.parse(readFileSync(`${dir}/${String(m.qq ?? m.name).replace(/[\\/:*?"<>|\s]/g, '_')}.json`, 'utf8')) as { phrases?: Array<{ g: string }> };
+          const ph = (p.phrases ?? []).slice(0, 4).map((x) => x.g).join('/');
+          return `- ${m.name}（${m.qq ?? '?'}）：${m.msgs} 条${ph ? `，常挂嘴边「${ph}」` : ''}`;
+        } catch {
+          return `- ${m.name}（${m.qq ?? '?'}）：${m.msgs} 条`;
+        }
+      });
+      const text = `群友档案（按发言量排序，只作参考，不必刻意提起）：\n${lines.join('\n')}`.slice(0, 800);
+      this.memberBriefCache = { key, text };
+      if (!this.memberBriefLogged) {
+        this.memberBriefLogged = true;
+        this.log.info(`群友档案注入：${idx.length} 人，${text.length} 字`);
+      }
+      return text;
+    } catch {
+      return '';
+    }
   }
 
   private unreadSummary(): string {
