@@ -546,7 +546,7 @@ export const QQ_DSH_GROUP: ConfigGroup = {
         type: 'string',
         title: 'DSH 白名单（QQ 号）',
         'x-hot': true,
-        description: '允许用「!dsh」的 QQ 号，逗号分隔（如 344380045,2961227626）。留空则用内置的两个主人号。',
+        description: '允许用「!dsh」的 QQ 号，逗号分隔（如 344380045,2961227626）。留空 = 关闭 DSH 桥接：任何人都发不进去，消息也不会进模型。',
       },
     },
   },

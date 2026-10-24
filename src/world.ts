@@ -313,7 +313,7 @@ export class QQWorld implements World {
     let ids: string[] = [];
     if (Array.isArray(raw)) ids = raw.map((x) => String(x).trim()).filter(Boolean);
     else if (typeof raw === 'string') ids = raw.split(/[\s,，]+/).map((x) => x.trim()).filter(Boolean);
-    if (!ids.length) ids = ['344380045', '2961227626'];
+    // 留空 = 关闭功能：谁都不允许（不再回退内置主人号）
     return ids.includes(userId);
   }
 
@@ -1498,7 +1498,9 @@ export class QQWorld implements World {
     // 也会给 message_id，这里补上入站消息，使「引用消息」功能完整闭环。
     const idTag = ev.message_id != null ? `#${ev.message_id} ` : '';
     // !dsh：主人私聊专用，直接进 DSH 队列，不经过模型（也不算群消息采样）
-    if (conv.kind === 'private' && this.dshAllowed(String(sender.userId)) && /^[!！]dsh\s+/.test(text)) {
+    if (conv.kind === 'private' && /^[!！]dsh\s+/.test(text)) {
+      // 白名单留空 = 关闭：静默忽略，既不回复也不让模型看到
+      if (!this.dshAllowed(String(sender.userId))) return;
       const task = text.replace(/^[!！]dsh\s+/, '').trim();
       if (task) {
         const quota = this.dshTakeDecide(String(sender.userId), task);
