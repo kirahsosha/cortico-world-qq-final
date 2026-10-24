@@ -506,8 +506,6 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
       'worlds.qqbot.groupSpeak.cooldownSec': { type: 'integer', title: '采样冷却(秒)', minimum: 0, maximum: 3600, 'x-hot': true, description: '同一群里两次抽样推送的最小间隔；0=不限制。' },
       'worlds.qqbot.groupSpeak.botAliases': { type: 'string', title: '点名识别词(逗号分隔)', 'x-hot': true, description: '群里正文命中这些词就当作被 @，必定推给模型。留空只用账号昵称。例：鲸鲸,大肥鱼,肥鱼' },
       'worlds.qqbot.groupSpeak.pushRuleScript': { type: 'string', title: '推送判定脚本(JS，返回 true 才推)', 'x-hot': true, description: '留空=内置逻辑。变量：text、kind、senderId、atMe、nameHit、sampleRate、cooldownSec、lastAgoMs、rand。报错自动回退（脚本等同管理员权限）。' },
-      'worlds.qqbot.listen.sampleRate': { type: 'number', title: '群消息采样率', minimum: 0, maximum: 1, multipleOf: 0.05, 'x-hot': true, description: '不是每条群消息都推给模型：被 @ 或私聊永远推；其余按此概率抽样。1=全推，0.3=大约三条挑一条，0=只在被 @ 时推。降低它同时减少模型调用和话痨感。' },
-      'worlds.qqbot.listen.cooldownSec': { type: 'integer', title: '采样冷却(秒)', minimum: 0, maximum: 3600, 'x-hot': true, description: '同一个群里两次抽样推送的最小间隔；0=不限制。防止热闹的群把采样额度用光。' },
       'worlds.qqbot.antiLoop.enabled': { type: 'boolean', title: '话题自动结束', 'x-hot': true, description: '开启后统计单会话 bot 连续发言次数与对方静默时长，超限自动收尾，避免话题死循环。' },
       'worlds.qqbot.antiLoop.maxConsecutiveBotTurns': { type: 'integer', title: '连续发言上限', minimum: 1, maximum: 50, 'x-hot': true, description: '单会话内 bot 连续发言达到该次数（对方发消息即清零），下次发言被拦截并提示收尾。' },
       'worlds.qqbot.antiLoop.idleToEndSec': { type: 'integer', title: '对方静默收尾(秒)', minimum: 0, maximum: 86400, 'x-hot': true, description: '对方静默超过该秒数且 bot 已发过言则自动收尾；0=关闭该规则。' },
