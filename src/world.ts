@@ -1519,7 +1519,9 @@ export class QQWorld implements World {
         }
         try {
           mkdirSync('/data/dsh-inbox', { recursive: true });
-          writeFileSync(`/data/dsh-inbox/${Date.now()}.json`, JSON.stringify({ task, sessionKey: conv.address }), 'utf8');
+          const shared = (this.config as unknown as { dshSharedSession?: unknown }).dshSharedSession !== false;
+          const sessKey = shared ? 'qq-shared' : conv.address;
+          writeFileSync(`/data/dsh-inbox/${Date.now()}.json`, JSON.stringify({ task, sessionKey: sessKey }), 'utf8');
           this.log.info('!dsh 已入队', { task: task.slice(0, 40), today: quota.count });
         } catch (e) {
           this.log.warn('!dsh 入队失败', { err: String(e) });

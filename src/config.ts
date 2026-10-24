@@ -553,6 +553,12 @@ export const QQ_DSH_GROUP: ConfigGroup = {
         'x-hot': true,
         description: '每天最多跑几条；0 = 不限制。超限直接回「今天的 DSH 额度用完了（N/N），明天再来」。',
       },
+      'worlds.qqbot.dshSharedSession': {
+        type: 'boolean',
+        title: 'QQ 共用一个 DSH 会话',
+        'x-hot': true,
+        description: '开启时所有 QQ 私聊/群聊的 !dsh 都写进同一个 DSH 会话（上下文连续、不会越攒越多）。关闭则按会话地址各建一个。',
+      },
       'worlds.qqbot.dshAllowedUsers': {
         type: 'string',
         title: 'DSH 白名单（QQ 号）',
