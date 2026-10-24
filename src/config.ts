@@ -36,6 +36,10 @@ export interface QQAsrConfig {
 }
 
 export interface QQWorldConfig {
+  /** 群里被"点名"的识别词（逗号分隔），命中视同 @。 */
+  botAliases: string;
+  /** 自定义推送判定脚本（同步函数体，返回 boolean）。空 = 用内置逻辑。 */
+  pushRuleScript: string;
   /** 连接模式：reverse=Cortico 开 WS 服务端等 NapCat 连（fat-fish 风格）；forward=Cortico 连 NapCat 的 wsUrl（内置风格）。 */
   mode: 'reverse' | 'forward';
   /** forward 模式：NapCat 暴露的 WebSocket 地址。 */
@@ -260,6 +264,10 @@ export interface QQWorldConfig {
 
 
 export const QQ_DEFAULTS: QQWorldConfig = {
+  /** 群里被"点名"的识别词（逗号分隔），命中视同 @。 */
+  botAliases: '鲸鲸',
+  /** 自定义推送判定脚本（同步函数体，返回 boolean）。空 = 用内置逻辑。 */
+  pushRuleScript: '',
   mode: 'reverse',
   // 默认关闭：qq_send 发 private:<QQ> 时一律查监听名单，群里任何人无法让 bot 私聊任意 QQ 号。
   // 仅当你确实需要 bot 主动私聊「非监听会话里的某个人」时再开（此时仍受监听/授权约束保护）。
@@ -525,7 +533,40 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
   };
 
   /** 语音收发配置分组：收语音转文字、发语音，两种实现可切。路径/模型均不写死，由下方各字段或环境变量决定。 */
-  /** 「!dsh <任务>」免模型通道的额度与白名单。 */
+  /** 群消息要不要推给模型：点名词 + 自定义脚本。 */
+export const QQ_PUSH_GROUP: ConfigGroup = {
+  id: 'world:qqbot-push',
+  owner: 'world:qqbot-push',
+  schema: {
+    type: 'object',
+    title: 'QQ · 群消息推送',
+    description: '决定哪些群消息会被交给模型（之后回不回由提示词里的规则和模型判断）。改完即时生效。',
+    properties: {
+      'worlds.qqbot.botAliases': {
+        type: 'string',
+        title: '点名识别词（逗号分隔）',
+        'x-hot': true,
+        description: '群里正文命中这些词就当作被 @：必定推给模型。留空则只用账号昵称匹配。例：鲸鲸,大肥鱼,肥鱼',
+      },
+      'worlds.qqbot.pushRuleScript': {
+        type: 'string',
+        title: '推送判定脚本（JS）',
+        'x-hot': true,
+        description: '留空 = 内置逻辑（@ 与点名必推，其余按采样率+冷却）。填了则完全由脚本决定，必须 return true/false。可用变量见默认脚本注释。',
+        default: `// 返回 true = 这条消息推给模型（再由模型决定回不回）
+// 可用变量：text 正文 / kind 'group'|'private' / senderId QQ号 / atMe 被@
+//           nameHit 命中点名词 / sampleRate 采样率 / cooldownSec 冷却秒
+//           lastAgoMs 距上次同群推送的毫秒 / rand 0~1 随机数
+if (kind !== 'group' || atMe || nameHit) return true;
+if (sampleRate <= 0) return false;
+if (cooldownSec > 0 && lastAgoMs < cooldownSec * 1000) return false;
+return rand <= sampleRate;`,
+      },
+    },
+  },
+};
+
+/** 「!dsh <任务>」免模型通道的额度与白名单。 */
 export const QQ_DSH_GROUP: ConfigGroup = {
   id: 'world:qqbot-dsh',
   owner: 'world:qqbot-dsh',

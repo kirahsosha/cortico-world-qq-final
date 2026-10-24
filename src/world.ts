@@ -6,7 +6,7 @@ import { type BlobInput, type EventEnvelope, type Language, type Logger, type Pr
 import { shortTime } from 'cortico/core/util.ts';
 import { OneBotDriver } from './driver.ts';
 import { QZonePoster, type QZoneConfig } from './qzone.ts';
-import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DSH_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
+import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DSH_GROUP, QQ_PUSH_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
 import { transcribeRecord, synthesizeVoice, judgeVoiceWish, checkVoiceDeps, voiceReady, splitIntoSentences, type RuntimeVoiceCfg } from './voice.ts';
 import { isAbsolute, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1364,7 +1364,10 @@ export class QQWorld implements World {
     pushAlias(this.identity?.nickname);
     const configured = (this.config as unknown as { botAliases?: unknown }).botAliases;
     if (Array.isArray(configured)) for (const a of configured) pushAlias(a);
-    pushAlias('鲸鲸');
+    // 点名词来自配置（逗号/空格分隔），留空则只靠昵称
+    const aliasCfg = (this.config as unknown as { botAliases?: unknown }).botAliases;
+    if (Array.isArray(aliasCfg)) for (const a of aliasCfg) pushAlias(a);
+    else if (typeof aliasCfg === 'string') for (const a of aliasCfg.split(/[\s,，、]+/)) pushAlias(a);
     const nameHit = plainText.length > 0 && aliases.some((a) => plainText.includes(a));
     if (nameHit && !atMeDirect) {
       this.log.info('群聊点名按 @ 处理', { alias: aliases.find((a) => plainText.includes(a)) });
@@ -1532,7 +1535,7 @@ export class QQWorld implements World {
       }
     }
 
-    if (!this.shouldPushEvent(conv.kind, conv.address, atMe)) {
+    if (!this.shouldPushEvent(conv.kind, conv.address, atMe, nameHit, text)) {
       this.log.info('群消息采样：本条不推给模型', { conv: conv.address });
       return;
     }
@@ -1906,17 +1909,51 @@ export class QQWorld implements World {
    * 这条消息要不要推给模型。私聊与被 @ 永远推；群里其它消息按 listen.sampleRate 抽样，
    * 并受 listen.cooldownSec 冷却——否则热闹的群会把采样额度一次用光。
    */
-  private shouldPushEvent(kind: string, address: string, atMe: boolean): boolean {
+  /** 自定义推送脚本的编译缓存（配置变了就重编）。 */
+  private pushRule: { src: string; fn: (...args: unknown[]) => unknown } | null = null;
+
+  /** 内置判定：不经脚本时的行为。 */
+  private builtinPush(kind: string, address: string, atMe: boolean, sampleRate: number, cooldownSec: number, last: number, now: number): boolean {
     if (kind !== 'group' || atMe) return true;
-    const l = this.config.listen;
-    if (!l || l.sampleRate >= 1) return true;
-    if (l.sampleRate <= 0) return false;
-    const now = Date.now();
-    const last = this.lastSampledPush.get(address) ?? 0;
-    if (l.cooldownSec > 0 && now - last < l.cooldownSec * 1000) return false;
-    if (Math.random() > l.sampleRate) return false;
+    if (sampleRate >= 1) return true;
+    if (sampleRate <= 0) return false;
+    if (cooldownSec > 0 && now - last < cooldownSec * 1000) return false;
+    if (Math.random() > sampleRate) return false;
     this.lastSampledPush.set(address, now);
     return true;
+  }
+
+  /**
+   * 这条消息要不要推给模型。
+   * 配了 pushRuleScript 就完全交给脚本（可用变量见默认脚本注释）；脚本报错则回退内置逻辑。
+   * 注意：脚本在这个进程里执行，等同管理员权限 —— 只写你自己看得懂的代码。
+   */
+  private shouldPushEvent(kind: string, address: string, atMe: boolean, nameHit = false, text = ''): boolean {
+    const l = this.config.listen;
+    const sampleRate = l?.sampleRate ?? 1;
+    const cooldownSec = l?.cooldownSec ?? 0;
+    const now = Date.now();
+    const last = this.lastSampledPush.get(address) ?? 0;
+    const rand = Math.random();
+
+    const src = String((this.config as unknown as { pushRuleScript?: unknown }).pushRuleScript ?? '').trim();
+    if (src) {
+      try {
+        if (!this.pushRule || this.pushRule.src !== src) {
+          // eslint-disable-next-line no-new-func
+          const fn = new Function('text', 'kind', 'senderId', 'atMe', 'nameHit', 'sampleRate', 'cooldownSec', 'lastAgoMs', 'rand', src);
+          this.pushRule = { src, fn };
+        }
+        const out = this.pushRule.fn(text, kind, address, atMe, nameHit, sampleRate, cooldownSec, now - last, rand);
+        if (out === true) { if (kind === 'group' && !atMe && !nameHit) this.lastSampledPush.set(address, now); return true; }
+        if (out === false) return false;
+        this.log.warn('推送脚本没有返回布尔值，按内置逻辑处理', { got: typeof out });
+      } catch (e) {
+        this.log.warn('推送脚本报错，按内置逻辑处理', { err: String(e) });
+        this.pushRule = null;
+      }
+    }
+    return this.builtinPush(kind, address, atMe, sampleRate, cooldownSec, last, now);
   }
 
   private recordGroupSpeak(address: string): void {
@@ -3081,7 +3118,7 @@ export class QQWorld implements World {
         },
       ],
       links: [],
-      config: [QQ_CONFIG_GROUP, QQ_DSH_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP],
+      config: [QQ_CONFIG_GROUP, QQ_DSH_GROUP, QQ_PUSH_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP],
     };
   }
 
@@ -3185,6 +3222,7 @@ export class QQWorld implements World {
     const map: Record<string, any> = {
       'world:qqbot': QQ_CONFIG_GROUP,
       'world:qqbot-dsh': QQ_DSH_GROUP,
+      'world:qqbot-push': QQ_PUSH_GROUP,
       'world:qqbot-voice': QQ_VOICE_GROUP,
       'world:qqbot-asr': QQ_ASR_GROUP,
     };
