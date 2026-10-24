@@ -306,6 +306,62 @@ export class QQWorld implements World {
   private outboxTimer: ReturnType<typeof setInterval> | null = null;
   private readonly outboxDir = '/data/qq-outbox';
 
+  /** !dsh 白名单：来自 config.dshAllowedUsers（字符串逗号分隔或数组），缺省用内置主人号。 */
+  private dshAllowed(userId: string): boolean {
+    const cfg = this.config as unknown as { dshAllowedUsers?: unknown };
+    const raw = cfg.dshAllowedUsers;
+    let ids: string[] = [];
+    if (Array.isArray(raw)) ids = raw.map((x) => String(x).trim()).filter(Boolean);
+    else if (typeof raw === 'string') ids = raw.split(/[\s,，]+/).map((x) => x.trim()).filter(Boolean);
+    if (!ids.length) ids = ['344380045', '2961227626'];
+    return ids.includes(userId);
+  }
+
+  /** 配额与审计：按自然日计数，超限拒绝；新的一天首次使用时补发前一天摘要。 */
+  private dshTakeDecide(userId: string, task: string): { ok: boolean; count: number; limit: number; reason: string } {
+    const cfg = this.config as unknown as { dshQuotaPerDay?: unknown };
+    const limit = Number(cfg.dshQuotaPerDay ?? 20) || 0;   // 0 或负数 = 不限制
+    const file = '/data/dsh-quota.json';
+    const today = new Date().toLocaleDateString('sv-SE');    // YYYY-MM-DD
+    let st: { date: string; count: number; tasks: Array<{ ts: string; from: string; preview: string }> } = { date: today, count: 0, tasks: [] };
+    try {
+      const got = JSON.parse(readFileSync(file, 'utf8'));
+      if (got && typeof got === 'object') st = { date: String(got.date ?? ''), count: Number(got.count ?? 0), tasks: Array.isArray(got.tasks) ? got.tasks : [] };
+    } catch { /* 首次 */ }
+
+    if (st.date !== today) {
+      // 跨天：先把昨天的摘要推出去（有记录才发）
+      if (st.date && st.tasks.length) {
+        const lines = st.tasks.slice(0, 12).map((t, i) => `${i + 1}. [${t.ts}] ${t.preview}`);
+        const more = st.tasks.length > 12 ? `\n…还有 ${st.tasks.length - 12} 条` : '';
+        try {
+          const dir = '/data/qq-outbox';
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(`${dir}/dsh-summary-${Date.now()}.json`, JSON.stringify({
+            to: 'private:344380045',
+            text: `【DSH 日报 ${st.date}】共 ${st.tasks.length} 条：\n${lines.join('\n')}${more}`,
+          }), 'utf8');
+        } catch { /* ignore */ }
+      }
+      st = { date: today, count: 0, tasks: [] };
+    }
+
+    if (limit > 0 && st.count >= limit) {
+      return { ok: false, count: st.count, limit, reason: `今天的 DSH 额度用完了（${st.count}/${limit}），明天再来。` };
+    }
+
+    st.count += 1;
+    const now = new Date();
+    st.tasks.push({
+      ts: now.toTimeString().slice(0, 5),
+      from: userId,
+      preview: task.replace(/\s+/g, ' ').slice(0, 40),
+    });
+    if (st.tasks.length > 200) st.tasks = st.tasks.slice(-200);
+    try { writeFileSync(file, JSON.stringify(st), 'utf8'); } catch { /* ignore */ }
+    return { ok: true, count: st.count, limit, reason: '' };
+  }
+
   private startOutbox(): void {
     if (this.outboxTimer) return;
     try { mkdirSync(`${this.outboxDir}/sent`, { recursive: true }); mkdirSync(`${this.outboxDir}/failed`, { recursive: true }); } catch { /* ignore */ }
@@ -1442,13 +1498,24 @@ export class QQWorld implements World {
     // 也会给 message_id，这里补上入站消息，使「引用消息」功能完整闭环。
     const idTag = ev.message_id != null ? `#${ev.message_id} ` : '';
     // !dsh：主人私聊专用，直接进 DSH 队列，不经过模型（也不算群消息采样）
-    if (conv.kind === 'private' && ['344380045', '2961227626'].includes(String(sender.userId)) && /^[!！]dsh\s+/.test(text)) {
+    if (conv.kind === 'private' && this.dshAllowed(String(sender.userId)) && /^[!！]dsh\s+/.test(text)) {
       const task = text.replace(/^[!！]dsh\s+/, '').trim();
       if (task) {
+        const quota = this.dshTakeDecide(String(sender.userId), task);
+        if (!quota.ok) {
+          try {
+            await this.driver?.callApi('send_msg', {
+              message_type: 'private',
+              user_id: Number(sender.userId),
+              message: [{ type: 'text', data: { text: quota.reason } }],
+            });
+          } catch { /* ignore */ }
+          return;
+        }
         try {
           mkdirSync('/data/dsh-inbox', { recursive: true });
           writeFileSync(`/data/dsh-inbox/${Date.now()}.json`, JSON.stringify({ task, sessionKey: conv.address }), 'utf8');
-          this.log.info('!dsh 已入队', { task: task.slice(0, 40) });
+          this.log.info('!dsh 已入队', { task: task.slice(0, 40), today: quota.count });
         } catch (e) {
           this.log.warn('!dsh 入队失败', { err: String(e) });
         }
@@ -1456,7 +1523,7 @@ export class QQWorld implements World {
           await this.driver?.callApi('send_msg', {
             message_type: 'private',
             user_id: Number(sender.userId),
-            message: [{ type: 'text', data: { text: '收到，已转给 DSH，跑完会把结果发回来。' } }],
+            message: [{ type: 'text', data: { text: `收到，已转给 DSH（今天第 ${quota.count}/${quota.limit} 条），跑完会把结果发回来。` } }],
           });
         } catch { /* ignore */ }
         return;
