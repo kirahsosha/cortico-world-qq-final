@@ -31,7 +31,7 @@ const MODULES: ModuleSpec[] = [
   { id: 'sticker', title: '表情包', desc: '自动收藏表情包：下载消息里的图片并标注情感/用处。', group: 'world:qqbot', prefix: 'worlds.qqbot.sticker.', topOnly: false },
   { id: 'proactive', title: '主动说话', desc: '后台按状态机向监听会话主动冒泡闲聊。', group: 'world:qqbot', prefix: 'worlds.qqbot.proactive.', topOnly: false },
   { id: 'qzone', title: 'QQ空间', desc: 'QQ 空间动态发布、自动冒泡与评论回复。', group: 'world:qqbot', prefix: 'worlds.qqbot.qzone.', topOnly: false },
-  { id: 'group-speak', title: '群聊限速', desc: '限制每个群单位窗口内 bot 发出的消息总量。', group: 'world:qqbot', prefix: 'worlds.qqbot.groupSpeak.', topOnly: false },
+  { id: 'group-speak', title: '群聊限速', desc: '群消息进不进来（采样/冷却/点名/脚本）与 bot 说多少（窗口内条数）。改完即时生效。', group: 'world:qqbot', prefix: 'worlds.qqbot.groupSpeak.', topOnly: false },
   { id: 'anti-loop', title: '防刷/话题结束', desc: '统计连续发言与静默时长，超限自动收尾。', group: 'world:qqbot', prefix: 'worlds.qqbot.antiLoop.', topOnly: false },
   { id: 'routine', title: '作息功能', desc: '睡眠/午休/活跃作息，到点播报。', group: 'world:qqbot', prefix: 'worlds.qqbot.routine.', topOnly: false },
   { id: 'reminder', title: '到点提醒', desc: '定时提醒到点自动发到对应会话。', group: 'world:qqbot', prefix: 'worlds.qqbot.reminder.', topOnly: false },
