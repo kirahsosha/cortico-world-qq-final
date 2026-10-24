@@ -1,0 +1,27 @@
+{
+  "name": "cortico-world-import",
+  "version": "0.1.0",
+  "description": "Cortico World 扩展：导入 QQ 导出聊天记录 → 聚合群友档案 → 导出 cortico-memory-export 供 mem_transfer(import) 冷启动。",
+  "type": "module",
+  "main": "./src/index.ts",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "cortico": {
+    "kind": "world",
+    "api": 6,
+    "label": "聊天记录导入"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "keywords": [
+    "cortico-world",
+    "cortico",
+    "qq",
+    "import",
+    "archive"
+  ]
+}

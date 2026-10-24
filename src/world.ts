@@ -3008,11 +3008,31 @@ export class QQWorld implements World {
       },
     };
 
+    const memberProfileTool: ToolDef = {
+      name: 'qq_member_profile',
+      tags: ['read'],
+      barrierAfter: true,
+      description:
+        '查单个群友的完整档案：画像、口头禅、常聊话题、语气、人际关系、活跃时段、高频片段。\n' +
+        '参数 who 传 QQ 号或昵称（可以只给昵称的一部分，如「倒爷」）。\n' +
+        '当有人问「XX 是个什么样的人」「XX 爱说什么/口头禅是什么」，或你要针对某个群友说话、接梗时，先调本工具，别凭印象编。',
+      parameters: {
+        type: 'object',
+        properties: { who: { type: 'string', description: 'QQ 号或昵称（可用昵称的一部分）。' } },
+        required: ['who'],
+      },
+      handler: async (args) => {
+        this.log.info('调用 qq_member_profile');
+        const who = typeof args.who === 'string' ? args.who : '';
+        return this.memberProfile(who);
+      },
+    };
+
     /*
      * 组装所有工具。
      */
 
-    const tools: ToolDef[] = [forwardById, send, confirm, viewImage, stickerStats, stickerToFavorites, stickerTag, proactiveTool, qzoneTool, poke, reminderTool, adminTool, ...makeHistoryTools({
+    const tools: ToolDef[] = [forwardById, send, confirm, viewImage, stickerStats, stickerToFavorites, stickerTag, memberProfileTool, proactiveTool, qzoneTool, poke, reminderTool, adminTool, ...makeHistoryTools({
       getHost: () => this.host,
       sourceId: SOURCE,
       timezone: this.config.timezone,
@@ -3364,35 +3384,85 @@ export class QQWorld implements World {
     };
   }
 
-  /** 群友档案速查：读 /data/home/companion/data/members/index.json + 每人档案，拼成 ≤800 字。 */
-  private memberBriefCache: { key: string; text: string } | null = null;
+  /** 群友档案速查：读 /data/home/companion/data/members/index.json + 每人 llm.summary，8 人约 400 字。 */
   private memberBriefLogged = false;
   private memberBrief(): string {
     try {
       const dir = '/data/home/companion/data/members';
       const idx = JSON.parse(readFileSync(`${dir}/index.json`, 'utf8')) as Array<{ qq?: string; name: string; msgs: number }>;
       if (!Array.isArray(idx) || !idx.length) return '';
-      const key = `${idx.length}:${idx[0]?.msgs ?? 0}`;
-      if (this.memberBriefCache && this.memberBriefCache.key === key) return this.memberBriefCache.text;
-
       const lines = idx.slice(0, 8).map((m) => {
+        const safe = String(m.qq ?? m.name).replace(/[\\/:*?"<>|\s]/g, '_');
         try {
-          const p = JSON.parse(readFileSync(`${dir}/${String(m.qq ?? m.name).replace(/[\\/:*?"<>|\s]/g, '_')}.json`, 'utf8')) as { phrases?: Array<{ g: string }> };
+          const p = JSON.parse(readFileSync(`${dir}/${safe}.json`, 'utf8')) as {
+            llm?: { summary?: string };
+            phrases?: Array<{ g: string }>;
+          };
+          const summary = (p.llm?.summary ?? '').trim();
+          if (summary) return `- ${m.name}（${m.qq ?? '?'}）：${summary}`;
           const ph = (p.phrases ?? []).slice(0, 4).map((x) => x.g).join('/');
           return `- ${m.name}（${m.qq ?? '?'}）：${m.msgs} 条${ph ? `，常挂嘴边「${ph}」` : ''}`;
         } catch {
           return `- ${m.name}（${m.qq ?? '?'}）：${m.msgs} 条`;
         }
       });
-      const text = `群友档案（按发言量排序，只作参考，不必刻意提起）：\n${lines.join('\n')}`.slice(0, 800);
-      this.memberBriefCache = { key, text };
+      const text = `群友档案（按发言量排序，只作参考，不必刻意提起；要看某人完整档案可调 qq_member_profile）：\n${lines.join('\n')}`.slice(0, 1000);
       if (!this.memberBriefLogged) {
         this.memberBriefLogged = true;
-        this.log.info(`群友档案注入：${idx.length} 人，${text.length} 字`);
+        this.log.info(`群友档案注入：${idx.length} 人，${text.length} 字（llm.summary 模式）`);
       }
       return text;
     } catch {
       return '';
+    }
+  }
+
+  /** 单人完整档案：按 QQ 号或昵称查 members/index.json + <key>.json，返回可读文本。 */
+  private memberProfile(who: string): string {
+    try {
+      const dir = '/data/home/companion/data/members';
+      const idx = JSON.parse(readFileSync(`${dir}/index.json`, 'utf8')) as Array<{ qq?: string | null; name: string; msgs: number; last?: string }>;
+      if (!Array.isArray(idx) || !idx.length) return '还没有群友档案（members/index.json 为空）。';
+      const q = who.trim();
+      if (!q) return '请提供 QQ 号或昵称（可以是昵称的一部分）。';
+      const qLower = q.toLowerCase();
+      let hits = idx.filter((m) => String(m.qq ?? '') === q);
+      if (!hits.length) hits = idx.filter((m) => m.name.includes(q) || q.includes(m.name));
+      if (!hits.length) hits = idx.filter((m) => m.name.toLowerCase().includes(qLower));
+      if (!hits.length) return `没找到「${q}」的档案；试试群友档案速查里出现过的名字。`;
+      const m = hits[0];
+      const safe = String(m.qq ?? m.name).replace(/[\\/:*?"<>|\s]/g, '_');
+      const p = JSON.parse(readFileSync(`${dir}/${safe}.json`, 'utf8')) as {
+        names?: string[];
+        msgs?: number;
+        avgLen?: number;
+        activeHours?: number[];
+        phrases?: Array<{ g: string; n: number }>;
+        llm?: {
+          summary?: string;
+          catchphrases?: string[];
+          topics?: string[];
+          tone?: string;
+          relations?: Array<{ who: string; how: string }>;
+          activeTime?: string;
+        };
+      };
+      const l = p.llm ?? {};
+      const alias = (p.names ?? []).filter((n) => n && n !== m.name).slice(0, 5);
+      const lines: string[] = [];
+      lines.push(`【${m.name}（QQ ${m.qq ?? '未知'}）】${alias.length ? `曾用名/别名：${alias.join('、')}` : ''}`);
+      if (l.summary) lines.push(`画像：${l.summary}`);
+      if (l.catchphrases && l.catchphrases.length) lines.push(`口头禅：${l.catchphrases.join(' / ')}`);
+      if (l.topics && l.topics.length) lines.push(`常聊：${l.topics.join(' / ')}`);
+      if (l.tone) lines.push(`语气：${l.tone}`);
+      if (l.relations && l.relations.length) lines.push(`关系：${l.relations.map((r) => `${r.who}（${r.how}）`).join('；')}`);
+      if (l.activeTime) lines.push(`活跃：${l.activeTime}`);
+      lines.push(`数据：${p.msgs ?? m.msgs} 条，平均 ${p.avgLen ?? '?'} 字/条${p.activeHours && p.activeHours.length ? `，主要活跃 ${p.activeHours.join('/')} 点` : ''}`);
+      if (p.phrases && p.phrases.length) lines.push(`高频片段：${p.phrases.slice(0, 8).map((x) => `${x.g}(${x.n})`).join(' ')}`);
+      if (!l.summary) lines.push('（该成员还没有 LLM 画像，以上只有统计信息。）');
+      return lines.join('\n');
+    } catch {
+      return '读取群友档案失败（文件缺失或格式不对）。';
     }
   }
 
