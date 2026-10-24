@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, readdirSync, openSync, mkdirSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, openSync, unlinkSync, mkdirSync, statSync, copyFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { type BlobInput, type EventEnvelope, type Language, type Logger, type PromptDocDecl, type ToolDef, type ToolSpec, type World, type WorldWebUiDecl, type WorldHost, type WorldLamp, type WorldPanelDecl, type WorldStreamSocket } from 'cortico/core/types.ts';
@@ -302,6 +302,51 @@ export class QQWorld implements World {
       : `forward ${c.wsUrl}`;
   }
 
+  /** 出站队列：外部写文件 → 这里发 QQ。 */
+  private outboxTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly outboxDir = '/data/qq-outbox';
+
+  private startOutbox(): void {
+    if (this.outboxTimer) return;
+    try { mkdirSync(`${this.outboxDir}/sent`, { recursive: true }); mkdirSync(`${this.outboxDir}/failed`, { recursive: true }); } catch { /* ignore */ }
+    this.outboxTimer = setInterval(() => { void this.drainOutbox(); }, 5000);
+    this.log.info('QQ 出站队列已启动', { dir: this.outboxDir });
+  }
+
+  private async drainOutbox(): Promise<void> {
+    const driver = this.driver;
+    if (!driver) return;
+    let names: string[] = [];
+    try { names = readdirSync(this.outboxDir).filter((n) => n.endsWith('.json')); } catch { return; }
+    for (const name of names.slice(0, 10)) {
+      const p = `${this.outboxDir}/${name}`;
+      let job: { to?: string; text?: string; tries?: number } | null = null;
+      try { job = JSON.parse(readFileSync(p, 'utf8')); } catch { job = null; }
+      if (!job || !job.to || !job.text) {
+        try { copyFileSync(p, `${this.outboxDir}/failed/${name}`); unlinkSync(p); } catch { /* ignore */ }
+        continue;
+      }
+      const [kind, idStr] = String(job.to).split(':');
+      const id = Number(idStr);
+      try {
+        await driver.callApi('send_msg', {
+          message_type: kind === 'group' ? 'group' : 'private',
+          ...(kind === 'group' ? { group_id: id } : { user_id: id }),
+          message: [{ type: 'text', data: { text: String(job.text).slice(0, 4000) } }],
+        });
+        try { copyFileSync(p, `${this.outboxDir}/sent/${name}`); unlinkSync(p); } catch { /* ignore */ }
+        this.log.info('出站队列已发送', { to: job.to, len: String(job.text).length });
+      } catch (e) {
+        const tries = Number(job.tries ?? 0) + 1;
+        try {
+          if (tries >= 3) { copyFileSync(p, `${this.outboxDir}/failed/${name}`); unlinkSync(p); }
+          else writeFileSync(p, JSON.stringify({ ...job, tries }), 'utf8');
+        } catch { /* ignore */ }
+        this.log.warn('出站队列发送失败', { to: job.to, tries, err: String(e) });
+      }
+    }
+  }
+
   async start(host: WorldHost): Promise<void> {
     this.host = this.wrapHost(host);
     this.log = this.host.log.child('qq');
@@ -325,6 +370,7 @@ export class QQWorld implements World {
     );
     this.syncConfigRoster();
     this.driver = this.createDriver();
+    this.startOutbox();
     await this.driver.start();
     this.loadState();
     this.initProactive();
@@ -774,6 +820,7 @@ export class QQWorld implements World {
   }
 
   async stop(): Promise<void> {
+    if (this.outboxTimer) { clearInterval(this.outboxTimer); this.outboxTimer = null; }
     for (const c of this.convs.values()) {
       if (c.aggregationTimer) {
         clearTimeout(c.aggregationTimer);
