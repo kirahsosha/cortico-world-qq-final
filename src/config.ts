@@ -92,6 +92,8 @@ export interface QQWorldConfig {
     dir: string;
     /** 是否在收藏表情包的同时把它加入 QQ 的「收藏表情」（custom face）。需协议端支持 add_custom_face（如 SnowLuma）；不支持时自动降级（仍存盘，但不进 QQ）。开启后 bot 收藏的表情会直接出现在你 QQ 客户端里。 */
     addToQQFavorites: boolean;
+    /** 协议端（NapCat 容器）能读到的共享目录：add_custom_face 只认真实文件路径。 */
+    sharedDir: string;
   };
   /** 主动说话调度器：后台按状态机向监听会话主动冒泡闲聊（事件驱动：只推 nudge，由主模型生成发送，不再用第二模型）。 */
   proactive: {
@@ -112,7 +114,7 @@ export interface QQWorldConfig {
   };
   /** QQ 空间（动态/说说）：按对话与记忆发表自己的看法/吐槽/简介，可附图与@，支持删除与评论回复。 */
   qzone: QZoneConfig;
-  /** 群聊发言频率限制：限制每个群在单位时间窗口内被 bot 主动+回复发出的消息总量，防止刷屏。 */
+  /** 群聊发言频率限制 + 群消息要不要推给模型：一个命名空间管全。 */
   groupSpeak: {
     /** 是否启用群聊发言频率限制。 */
     enabled: boolean;
@@ -120,6 +122,14 @@ export interface QQWorldConfig {
     maxPerWindow: number;
     /** 滑动窗口长度（秒）。 */
     windowSec: number;
+    /** 群消息采样率（0~1）：被 @ / 点名 / 脚本放行的必推，其余按此概率抽样。1=全推。 */
+    sampleRate: number;
+    /** 采样冷却（秒）：同一群里两次抽样推送的最小间隔；0=不限制。 */
+    cooldownSec: number;
+    /** 点名识别词（逗号分隔）：群里正文命中就当作被 @，必定推给模型。 */
+    botAliases: string;
+    /** 推送判定脚本（JS，返回 true 才推）：留空=内置逻辑。 */
+    pushRuleScript: string;
   };
   /** 话题自动结束 / 防死循环：统计单会话内 bot 连续发言次数，超过阈值或对方长时间未接话则自动收尾。 */
   antiLoop: {
@@ -293,6 +303,7 @@ export const QQ_DEFAULTS: QQWorldConfig = {
     captureMode: 'sticker',
     dir: '',
     addToQQFavorites: false,
+    sharedDir: '/shared',
   },
   proactive: {
     enabled: false,
@@ -327,6 +338,10 @@ export const QQ_DEFAULTS: QQWorldConfig = {
     enabled: true,
     maxPerWindow: 12,
     windowSec: 60,
+    sampleRate: 0.3,
+    cooldownSec: 90,
+    botAliases: '',
+    pushRuleScript: '',
   },
   antiLoop: {
     enabled: true,
@@ -459,6 +474,7 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
         'x-hot': false,
         description: 'sticker=仅 OneBot 表情包段；allImages=所有图片都当表情候选收藏。',
       },
+      'worlds.qqbot.sticker.sharedDir': { type: 'string', title: '共享目录', 'x-hot': true, description: 'NapCat 容器也挂载了的目录（两侧路径要一致，默认 /shared）。add_custom_face 只接受真实文件路径，图片会先落到这里再把路径交给协议端。' },
       'worlds.qqbot.sticker.addToQQFavorites': { type: 'boolean', title: '同步到 QQ 收藏表情', 'x-hot': true, description: '开启后，bot 每收藏一张表情包都会同时加入登录账号的 QQ「收藏表情」（custom face），你能在 QQ 客户端里直接看到/使用。依赖协议端支持 add_custom_face（如 SnowLuma）；不支持时自动降级（仍存盘，但不进 QQ）。注意 QQ 收藏表情有数量上限，超出会失败（可用 qq_sticker_to_favorites 的结果看到哪些没加进去）。' },
       'worlds.qqbot.proactive.enabled': { type: 'boolean', title: '主动说话调度器', 'x-hot': false, description: '开启后后台按状态机向监听会话主动冒泡闲聊（移植自 fat-fish ProactiveSpeaker）。' },
       'worlds.qqbot.proactive.mode': {
@@ -479,6 +495,10 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
       'worlds.qqbot.groupSpeak.enabled': { type: 'boolean', title: '群聊发言限速', 'x-hot': true, description: '开启后限制每个群在单位窗口内被 bot 发出的消息总量，防止刷屏/死循环灌水。' },
       'worlds.qqbot.groupSpeak.maxPerWindow': { type: 'integer', title: '窗口内最大条数', minimum: 1, maximum: 200, 'x-hot': true, description: '滑动窗口内允许发出的群消息上限（含主动与回复）。' },
       'worlds.qqbot.groupSpeak.windowSec': { type: 'integer', title: '窗口长度(秒)', minimum: 1, maximum: 3600, 'x-hot': true, description: '限速滑动窗口长度。' },
+      'worlds.qqbot.groupSpeak.sampleRate': { type: 'number', title: '群消息采样率', minimum: 0, maximum: 1, multipleOf: 0.05, 'x-hot': true, description: '不是每条群消息都推给模型：被 @、点名、脚本放行的必推；其余按此概率抽样。1=全推，0.3=约三条挑一条，0=只在被 @ 时推。' },
+      'worlds.qqbot.groupSpeak.cooldownSec': { type: 'integer', title: '采样冷却(秒)', minimum: 0, maximum: 3600, 'x-hot': true, description: '同一群里两次抽样推送的最小间隔；0=不限制。防止热闹的群把采样额度一次用光。' },
+      'worlds.qqbot.groupSpeak.botAliases': { type: 'string', title: '点名识别词(逗号分隔)', 'x-hot': true, description: '群里正文命中这些词就当作被 @，必定推给模型。留空则只用账号昵称匹配。例：鲸鲸,大肥鱼,肥鱼' },
+      'worlds.qqbot.groupSpeak.pushRuleScript': { type: 'string', title: '推送判定脚本(JS，返回 true 才推)', 'x-hot': true, description: '留空 = 内置逻辑。可用变量：text、kind、senderId、atMe、nameHit、sampleRate、cooldownSec、lastAgoMs、rand。脚本报错自动回退内置逻辑。注意：它跑在 Core 进程里，等同管理员权限。' },
       'worlds.qqbot.antiLoop.enabled': { type: 'boolean', title: '话题自动结束', 'x-hot': true, description: '开启后统计单会话 bot 连续发言次数与对方静默时长，超限自动收尾，避免话题死循环。' },
       'worlds.qqbot.antiLoop.maxConsecutiveBotTurns': { type: 'integer', title: '连续发言上限', minimum: 1, maximum: 50, 'x-hot': true, description: '单会话内 bot 连续发言达到该次数（对方发消息即清零），下次发言被拦截并提示收尾。' },
       'worlds.qqbot.antiLoop.idleToEndSec': { type: 'integer', title: '对方静默收尾(秒)', minimum: 0, maximum: 86400, 'x-hot': true, description: '对方静默超过该秒数且 bot 已发过言则自动收尾；0=关闭该规则。' },
@@ -506,6 +526,51 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
   },
   },
   };
+
+  /** 「!dsh <任务>」免模型通道的额度与白名单。 */
+  export const QQ_DSH_GROUP: ConfigGroup = {
+  id: 'world:qqbot-dsh',
+  owner: 'world:qqbot-dsh',
+  schema: {
+    type: 'object',
+    title: 'QQ · DSH 桥接',
+    description: '「!dsh <任务>」免模型通道：每日额度与白名单。改完即时生效，无需重启。',
+    properties: {
+      'worlds.qqbot.dshPetSessionId': {
+        type: 'string',
+        title: '桌宠的 DSH 会话 ID',
+        'x-hot': true,
+        description: '留空 = 下次自动新建一个，并把新 ID 回写到这里；填上就复用（会话没了会自动新建并覆盖）。桌宠窗口里的 DSH 任务用它。',
+      },
+      'worlds.qqbot.dshQqSessionId': {
+        type: 'string',
+        title: 'QQ 的 DSH 会话 ID',
+        'x-hot': true,
+        description: '留空 = 下次自动新建一个，并把新 ID 回写到这里；填上就复用（会话没了会自动新建并覆盖）。「!dsh」和 QQ 私聊里的 DSH 任务用它。',
+      },
+      'worlds.qqbot.dshSharedSession': {
+        type: 'boolean',
+        title: 'QQ 共用一个 DSH 会话',
+        'x-hot': true,
+        description: '开启时所有 QQ 私聊/群聊的 !dsh 都写进同一个 DSH 会话（上下文连续、不会越攒越多）。关闭则按会话地址各建一个。',
+      },
+      'worlds.qqbot.dshQuotaPerDay': {
+        type: 'integer',
+        title: 'DSH 每日条数上限',
+        minimum: 0,
+        maximum: 500,
+        'x-hot': true,
+        description: '每天最多跑几条；0 = 不限制。超限直接回「今天的 DSH 额度用完了（N/N），明天再来」。',
+      },
+      'worlds.qqbot.dshAllowedUsers': {
+        type: 'string',
+        title: 'DSH 白名单（QQ 号）',
+        'x-hot': true,
+        description: '允许用「!dsh」的 QQ 号，逗号分隔（如 344380045,2961227626）。留空 = 关闭 DSH 桥接：任何人都发不进去，消息也不会进模型。',
+      },
+    },
+  },
+};
 
   /** 语音收发配置分组：收语音转文字、发语音，两种实现可切。路径/模型均不写死，由下方各字段或环境变量决定。 */
   export const QQ_VOICE_GROUP: ConfigGroup = {
@@ -649,6 +714,7 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   if (c.sticker.captureMode !== 'sticker' && c.sticker.captureMode !== 'allImages') c.sticker.captureMode = 'sticker';
   if (typeof c.sticker.dir !== 'string') c.sticker.dir = '';
   if (typeof c.sticker.addToQQFavorites !== 'boolean') c.sticker.addToQQFavorites = false;
+  if (typeof c.sticker.sharedDir !== 'string' || !c.sticker.sharedDir.trim()) c.sticker.sharedDir = QQ_DEFAULTS.sticker.sharedDir;
   // proactive 子对象原地合并
   c.proactive = c.proactive ?? {};
   Object.assign(c.proactive, { ...QQ_DEFAULTS.proactive, ...(c.proactive as object) });
@@ -689,6 +755,11 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   if (typeof gs.enabled !== 'boolean') gs.enabled = true;
   if (typeof gs.maxPerWindow !== 'number' || (gs.maxPerWindow as number) < 1) gs.maxPerWindow = QQ_DEFAULTS.groupSpeak.maxPerWindow;
   if (typeof gs.windowSec !== 'number' || (gs.windowSec as number) < 1) gs.windowSec = QQ_DEFAULTS.groupSpeak.windowSec;
+  if (typeof gs.sampleRate !== 'number' || (gs.sampleRate as number) < 0) gs.sampleRate = QQ_DEFAULTS.groupSpeak.sampleRate;
+  if ((gs.sampleRate as number) > 1) gs.sampleRate = 1;
+  if (typeof gs.cooldownSec !== 'number' || (gs.cooldownSec as number) < 0) gs.cooldownSec = QQ_DEFAULTS.groupSpeak.cooldownSec;
+  if (typeof gs.botAliases !== 'string') gs.botAliases = QQ_DEFAULTS.groupSpeak.botAliases;
+  if (typeof gs.pushRuleScript !== 'string') gs.pushRuleScript = QQ_DEFAULTS.groupSpeak.pushRuleScript;
   c.antiLoop = c.antiLoop ?? {};
   Object.assign(c.antiLoop, { ...QQ_DEFAULTS.antiLoop, ...(c.antiLoop as object) });
   const al = c.antiLoop as Record<string, unknown>;

@@ -1,12 +1,12 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, readdirSync, openSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, openSync, mkdirSync, unlinkSync, copyFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { type BlobInput, type EventEnvelope, type Language, type Logger, type PromptDocDecl, type ToolDef, type ToolSpec, type World, type WorldWebUiDecl, type WorldHost, type WorldLamp, type WorldPanelDecl, type WorldStreamSocket } from 'cortico/core/types.ts';
 import { shortTime } from 'cortico/core/util.ts';
 import { OneBotDriver } from './driver.ts';
 import { QZonePoster, type QZoneConfig } from './qzone.ts';
-import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
+import { QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP, QQ_DSH_GROUP, QQ_DEFAULTS, normalizeConfig, toIds, type QQConfigSection, type QQWorldConfig } from './config.ts';
 import { transcribeRecord, synthesizeVoice, judgeVoiceWish, checkVoiceDeps, voiceReady, splitIntoSentences, type RuntimeVoiceCfg } from './voice.ts';
 import { isAbsolute, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -302,6 +302,107 @@ export class QQWorld implements World {
       : `forward ${c.wsUrl}`;
   }
 
+  /** 出站队列：外部写 /data/qq-outbox/*.json → 这里发 QQ（DSH 结果、跨天摘要都走它）。 */
+  private outboxTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly outboxDir = '/data/qq-outbox';
+
+  /** !dsh 白名单：worlds.qqbot.dshAllowedUsers（逗号分隔字符串或数组）。留空 = 关闭桥接。 */
+  private dshAllowed(userId: string): boolean {
+    const cfg = this.config as unknown as { dshAllowedUsers?: unknown };
+    const raw = cfg.dshAllowedUsers;
+    let ids: string[] = [];
+    if (Array.isArray(raw)) ids = raw.map((x) => String(x).trim()).filter(Boolean);
+    else if (typeof raw === 'string') ids = raw.split(/[\s,，]+/).map((x) => x.trim()).filter(Boolean);
+    // 留空 = 关闭功能：谁都不允许（不回退内置主人号）
+    return ids.includes(userId);
+  }
+
+  /** 配额与审计：按自然日计数，超限拒绝；新的一天首次使用时补发前一天摘要。 */
+  private dshTakeDecide(userId: string, task: string): { ok: boolean; count: number; limit: number; reason: string } {
+    const cfg = this.config as unknown as { dshQuotaPerDay?: unknown };
+    const limit = Number(cfg.dshQuotaPerDay ?? 20) || 0;   // 0 或负数 = 不限制
+    const file = '/data/dsh-quota.json';
+    const today = new Date().toLocaleDateString('sv-SE');    // YYYY-MM-DD
+    let st: { date: string; count: number; tasks: Array<{ ts: string; from: string; preview: string }> } = { date: today, count: 0, tasks: [] };
+    try {
+      const got = JSON.parse(readFileSync(file, 'utf8'));
+      if (got && typeof got === 'object') st = { date: String(got.date ?? ''), count: Number(got.count ?? 0), tasks: Array.isArray(got.tasks) ? got.tasks : [] };
+    } catch { /* 首次 */ }
+
+    if (st.date !== today) {
+      // 跨天：先把昨天的摘要推出去（有记录才发）
+      if (st.date && st.tasks.length) {
+        const lines = st.tasks.slice(0, 12).map((t, i) => `${i + 1}. [${t.ts}] ${t.preview}`);
+        const more = st.tasks.length > 12 ? `\n…还有 ${st.tasks.length - 12} 条` : '';
+        try {
+          const dir = '/data/qq-outbox';
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(`${dir}/dsh-summary-${Date.now()}.json`, JSON.stringify({
+            to: 'private:344380045',
+            text: `【DSH 日报 ${st.date}】共 ${st.tasks.length} 条：\n${lines.join('\n')}${more}`,
+          }), 'utf8');
+        } catch { /* ignore */ }
+      }
+      st = { date: today, count: 0, tasks: [] };
+    }
+
+    if (limit > 0 && st.count >= limit) {
+      return { ok: false, count: st.count, limit, reason: `今天的 DSH 额度用完了（${st.count}/${limit}），明天再来。` };
+    }
+
+    st.count += 1;
+    const now = new Date();
+    st.tasks.push({
+      ts: now.toTimeString().slice(0, 5),
+      from: userId,
+      preview: task.replace(/\s+/g, ' ').slice(0, 40),
+    });
+    if (st.tasks.length > 200) st.tasks = st.tasks.slice(-200);
+    try { writeFileSync(file, JSON.stringify(st), 'utf8'); } catch { /* ignore */ }
+    return { ok: true, count: st.count, limit, reason: '' };
+  }
+
+  private startOutbox(): void {
+    if (this.outboxTimer) return;
+    try { mkdirSync(`${this.outboxDir}/sent`, { recursive: true }); mkdirSync(`${this.outboxDir}/failed`, { recursive: true }); } catch { /* ignore */ }
+    this.outboxTimer = setInterval(() => { void this.drainOutbox(); }, 5000);
+    this.log.info('QQ 出站队列已启动', { dir: this.outboxDir });
+  }
+
+  private async drainOutbox(): Promise<void> {
+    const driver = this.driver;
+    if (!driver) return;
+    let names: string[] = [];
+    try { names = readdirSync(this.outboxDir).filter((n) => n.endsWith('.json')); } catch { return; }
+    for (const name of names.slice(0, 10)) {
+      const p = `${this.outboxDir}/${name}`;
+      let job: { to?: string; text?: string; tries?: number } | null = null;
+      try { job = JSON.parse(readFileSync(p, 'utf8')); } catch { job = null; }
+      if (!job || !job.to || !job.text) {
+        try { copyFileSync(p, `${this.outboxDir}/failed/${name}`); unlinkSync(p); } catch { /* ignore */ }
+        continue;
+      }
+      const [kind, idStr] = String(job.to).split(':');
+      const id = Number(idStr);
+      try {
+        await driver.callApi('send_msg', {
+          message_type: kind === 'group' ? 'group' : 'private',
+          ...(kind === 'group' ? { group_id: id } : { user_id: id }),
+          message: [{ type: 'text', data: { text: String(job.text).slice(0, 4000) } }],
+        });
+        try { copyFileSync(p, `${this.outboxDir}/sent/${name}`); unlinkSync(p); } catch { /* ignore */ }
+        this.log.info('出站队列已发送', { to: job.to, len: String(job.text).length });
+      } catch (e) {
+        const tries = Number(job.tries ?? 0) + 1;
+        try {
+          if (tries >= 3) { copyFileSync(p, `${this.outboxDir}/failed/${name}`); unlinkSync(p); }
+          else writeFileSync(p, JSON.stringify({ ...job, tries }), 'utf8');
+        } catch { /* ignore */ }
+        this.log.warn('出站队列发送失败', { to: job.to, tries, err: String(e) });
+      }
+    }
+  }
+
   async start(host: WorldHost): Promise<void> {
     this.host = this.wrapHost(host);
     this.log = this.host.log.child('qq');
@@ -326,6 +427,7 @@ export class QQWorld implements World {
     this.syncConfigRoster();
     this.driver = this.createDriver();
     await this.driver.start();
+    this.startOutbox();
     this.loadState();
     this.initProactive();
     this.initQzone();
@@ -778,6 +880,7 @@ export class QQWorld implements World {
   }
 
   async stop(): Promise<void> {
+    if (this.outboxTimer) { clearInterval(this.outboxTimer); this.outboxTimer = null; }
     for (const c of this.convs.values()) {
       if (c.aggregationTimer) {
         clearTimeout(c.aggregationTimer);
@@ -946,9 +1049,20 @@ export class QQWorld implements World {
   private async pushStickerToQQFavorites(bytes: Uint8Array, ext: string): Promise<string | null> {
     if (!this.config.sticker.addToQQFavorites) return null;
     if (!this.driver) return null;
-    const base64 = Buffer.from(bytes).toString('base64');
+    // NapCat 的 add_custom_face 只认本地文件路径（stat + readFile + emojiPath 都是路径），
+    // `base64://` 会被当成路径去 stat 而报 ENAMETOOLONG。所以先落到共享目录再传路径。
+    const dir = (this.config.sticker.sharedDir || '/shared').replace(/[\\/]+$/, '');
+    const extName = (ext || 'png').replace(/^\./, '') || 'png';
+    const file = `${dir}/sticker-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}.${extName}`;
     try {
-      const res = (await this.driver.callApi('add_custom_face', { file: `base64://${base64}` })) as
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(file, bytes);
+    } catch (e) {
+      this.log.warn('写入共享目录失败，跳过同步到 QQ 收藏表情', { dir, err: String(e) });
+      return null;
+    }
+    try {
+      const res = (await this.driver.callApi('add_custom_face', { file })) as
         | { emoji_id?: string; data?: { emoji_id?: string } }
         | undefined;
       const eid = res?.emoji_id ?? res?.data?.emoji_id ?? null;
@@ -956,7 +1070,7 @@ export class QQWorld implements World {
       else this.log.warn('add_custom_face 未返回 emoji_id', { res });
       return eid ?? null;
     } catch (e) {
-      this.log.warn('加入 QQ 收藏表情失败（协议端可能不支持 add_custom_face，或 QQ 收藏表情已达上限）', { err: String(e), ext });
+      this.log.warn('加入 QQ 收藏表情失败（协议端可能不支持 add_custom_face、共享目录没挂载，或已达上限）', { err: String(e), file });
       return null;
     }
   }
@@ -1216,7 +1330,31 @@ export class QQWorld implements World {
     const segs: OneBotSegment[] =
       typeof ev.message === 'string' ? [{ type: 'text', data: { text: ev.message } }] : (ev.message ?? []);
     const selfId = this.identity?.selfId ?? 0;
-    const atMe = segs.some((s) => s.type === 'at' && Number((s as { data: { qq: string } }).data.qq) === selfId);
+    const atMeDirect = segs.some((s) => s.type === 'at' && Number((s as { data: { qq: string } }).data.qq) === selfId);
+
+    // 没有 @、但正文里点了名（昵称/点名词），按 @ 处理：照样推给模型，由模型判断是不是在问它。
+    const plainText = segs
+      .filter((seg) => seg.type === 'text')
+      .map((seg) => String((seg as { data?: { text?: string } }).data?.text ?? ''))
+      .join('');
+    const aliases: string[] = [];
+    const pushAlias = (v: unknown): void => {
+      const t = typeof v === 'string' ? v.trim() : '';
+      if (t.length >= 2 && !aliases.includes(t)) aliases.push(t);
+    };
+    pushAlias(this.identity?.nickname);
+    const aliasArr = (this.config as unknown as { botAliases?: unknown }).botAliases;
+    if (Array.isArray(aliasArr)) for (const a of aliasArr) pushAlias(a);
+    // 点名词来自配置（逗号/空格分隔，groupSpeak.botAliases），留空则只靠昵称
+    const aliasCfg = (this.config.groupSpeak as unknown as { botAliases?: unknown }).botAliases;
+    if (Array.isArray(aliasCfg)) for (const a of aliasCfg) pushAlias(a);
+    else if (typeof aliasCfg === 'string') for (const a of aliasCfg.split(/[\s,，、]+/)) pushAlias(a);
+    pushAlias('鲸鲸');
+    const nameHit = plainText.length > 0 && aliases.some((a) => plainText.includes(a));
+    if (nameHit && !atMeDirect) {
+      this.log.info('群聊点名按 @ 处理', { alias: aliases.find((a) => plainText.includes(a)) });
+    }
+    const atMe = atMeDirect || nameHit;
 
     // 引用回复
     conv.quotedSenderId = undefined; // 每条消息重新判定，避免沿用上一条旧引用
@@ -1235,6 +1373,48 @@ export class QQWorld implements World {
 
     let text = renderIncoming(segs, { timezone: this.config.timezone, selfId, replyText, replyRef });
     this.log.info('HANDLE_IN kind=' + conv.kind + ' text=' + JSON.stringify(text).slice(0, 40));
+
+    // !dsh：白名单私聊专用，直接进 DSH 队列，不经过模型（也不算群消息采样）
+    if (conv.kind === 'private' && /^[!！]dsh\s+/.test(text)) {
+      // 白名单留空 = 关闭：静默忽略，既不回复也不让模型看到
+      if (!this.dshAllowed(String(sender.userId))) return;
+      const task = text.replace(/^[!！]dsh\s+/, '').trim();
+      if (task) {
+        const quota = this.dshTakeDecide(String(sender.userId), task);
+        if (!quota.ok) {
+          try {
+            await this.driver?.callApi('send_msg', {
+              message_type: 'private',
+              user_id: Number(sender.userId),
+              message: [{ type: 'text', data: { text: quota.reason } }],
+            });
+          } catch { /* ignore */ }
+          return;
+        }
+        try {
+          mkdirSync('/data/dsh-inbox', { recursive: true });
+          // QQ 的 !dsh 默认共用一个 DSH 会话（上下文连续、会话不会越攒越多）；关掉则按会话地址各建一个
+          const shared = (this.config as unknown as { dshSharedSession?: unknown }).dshSharedSession !== false;
+          const sessKey = shared ? 'qq-shared' : conv.address;
+          // 配置里的会话 ID：空串 = 让桌面世界那边新建一个再回写；字段不存在 = 老行为（宿主按 sessionKey 映射）
+          const sessCfg = this.config as unknown as { dshQqSessionId?: unknown };
+          const sessionId = typeof sessCfg.dshQqSessionId === 'string' ? sessCfg.dshQqSessionId.trim() : '';
+          // replyTo 才是结果要回到的 QQ 会话；sessionKey 只留给老宿主按会话映射
+          writeFileSync(`/data/dsh-inbox/${Date.now()}.json`, JSON.stringify({ task, sessionKey: sessKey, replyTo: conv.address, sessionId }), 'utf8');
+          this.log.info('!dsh 已入队', { task: task.slice(0, 40), today: quota.count });
+        } catch (e) {
+          this.log.warn('!dsh 入队失败', { err: String(e) });
+        }
+        try {
+          await this.driver?.callApi('send_msg', {
+            message_type: 'private',
+            user_id: Number(sender.userId),
+            message: [{ type: 'text', data: { text: `收到，已转给 DSH（今天第 ${quota.count}/${quota.limit} 条），跑完会把结果发回来。` } }],
+          });
+        } catch { /* ignore */ }
+        return;
+      }
+    }
     // 合并转发：异步展开内容作为补充事件（不阻塞主消息投递，对齐内置 lookupForward）
     const fwdSeg = segs.find((s) => s.type === 'forward');
     if (fwdSeg) {
@@ -1344,6 +1524,18 @@ export class QQWorld implements World {
     // 任意一条历史消息（对齐内置 qq world 的 idTag 渲染）。在自己发消息时 qq_send 的返回里
     // 也会给 message_id，这里补上入站消息，使「引用消息」功能完整闭环。
     const idTag = ev.message_id != null ? `#${ev.message_id} ` : '';
+    if (!this.shouldPushEvent(conv.kind, conv.address, atMe, nameHit, text)) {
+      this.log.info('群消息采样：本条不推给模型', { conv: conv.address });
+      return;
+    }
+    // 给桌面世界留个来源标记：桌面工具只认「主人私聊」或「非 QQ（本机）」。
+    // 同进程，另一个 World 读 globalThis 即可；带时间戳，过期就不算数。
+    (globalThis as unknown as Record<string, unknown>).__cuaOrigin = {
+      kind: conv.kind,
+      conv: conv.address,
+      user: String(sender.userId ?? ''),
+      ts: Date.now(),
+    };
     this.log.info('HANDLE_PUSH pre kind=' + conv.kind);
     // 记录"应当回复"的会话，供回合收束时兜底自动发送（模型若只输出文本未调 qq_send）。
     if (conv.kind === 'private' || atMe) this._pendingReplyConvs.add(conv.address);
@@ -1669,6 +1861,64 @@ export class QQWorld implements World {
   }
 
   // ---- 发送（草稿-确认门）----
+  // ---- 群消息采样 / 推送判定（groupSpeak.* 命名空间）----
+  /** 群消息采样：会话地址 -> 上次抽样推送的时间。 */
+  private lastSampledPush = new Map<string, number>();
+  /** 自定义推送脚本的编译缓存（配置变了就重编）。 */
+  private pushRule: { src: string; fn: (...args: unknown[]) => unknown } | null = null;
+
+  /** 采样与冷却的取值：groupSpeak.* 优先，退回旧 listen.*，都没有则全推。 */
+  private pushRates(): { sampleRate: number; cooldownSec: number } {
+    const gs = this.config.groupSpeak as unknown as { sampleRate?: unknown; cooldownSec?: unknown };
+    const ls = (this.config as unknown as { listen?: { sampleRate?: unknown; cooldownSec?: unknown } }).listen;
+    const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+    const sampleRate = num(gs.sampleRate) ?? num(ls?.sampleRate) ?? 1;
+    const cooldownSec = num(gs.cooldownSec) ?? num(ls?.cooldownSec) ?? 0;
+    return { sampleRate, cooldownSec };
+  }
+
+  /** 内置判定：不经脚本时的行为。私聊与被 @/点名永远推；群里其余消息按采样率抽样并受冷却限制。 */
+  private builtinPush(kind: string, address: string, atMe: boolean, sampleRate: number, cooldownSec: number, last: number, now: number): boolean {
+    if (kind !== 'group' || atMe) return true;
+    if (sampleRate >= 1) return true;
+    if (sampleRate <= 0) return false;
+    if (cooldownSec > 0 && now - last < cooldownSec * 1000) return false;
+    if (Math.random() > sampleRate) return false;
+    this.lastSampledPush.set(address, now);
+    return true;
+  }
+
+  /**
+   * 这条消息要不要推给模型。
+   * 配了 pushRuleScript 就完全交给脚本（可用变量见面板说明）；脚本报错/不返回布尔值则回退内置逻辑。
+   * 注意：脚本在这个进程里执行，等同管理员权限 —— 只写你自己看得懂的代码。
+   */
+  private shouldPushEvent(kind: string, address: string, atMe: boolean, nameHit = false, text = ''): boolean {
+    const { sampleRate, cooldownSec } = this.pushRates();
+    const now = Date.now();
+    const last = this.lastSampledPush.get(address) ?? 0;
+    const rand = Math.random();
+
+    const src = String((this.config.groupSpeak as unknown as { pushRuleScript?: unknown }).pushRuleScript ?? '').trim();
+    if (src) {
+      try {
+        if (!this.pushRule || this.pushRule.src !== src) {
+          // eslint-disable-next-line no-new-func
+          const fn = new Function('text', 'kind', 'senderId', 'atMe', 'nameHit', 'sampleRate', 'cooldownSec', 'lastAgoMs', 'rand', src);
+          this.pushRule = { src, fn };
+        }
+        const out = this.pushRule.fn(text, kind, address, atMe, nameHit, sampleRate, cooldownSec, now - last, rand);
+        if (out === true) { if (kind === 'group' && !atMe && !nameHit) this.lastSampledPush.set(address, now); return true; }
+        if (out === false) return false;
+        this.log.warn('推送脚本没有返回布尔值，按内置逻辑处理', { got: typeof out });
+      } catch (e) {
+        this.log.warn('推送脚本报错，按内置逻辑处理', { err: String(e) });
+        this.pushRule = null;
+      }
+    }
+    return this.builtinPush(kind, address, atMe, sampleRate, cooldownSec, last, now);
+  }
+
   // ---- 群聊发言限速 / 话题防死循环 ----
   private groupSpeakWindow(address: string): number[] {
     const gs = this.config.groupSpeak;
@@ -2799,7 +3049,7 @@ export class QQWorld implements World {
       { id: 'sticker', title: '表情包', description: '自动收藏表情包：下载消息里的图片并标注情感/用处。', group: 'world:qqbot', prefix: 'worlds.qqbot.sticker.', topOnly: false },
       { id: 'proactive', title: '主动说话', description: '后台按状态机向监听会话主动冒泡闲聊（移植自 fat-fish ProactiveSpeaker）。', group: 'world:qqbot', prefix: 'worlds.qqbot.proactive.', topOnly: false },
       { id: 'qzone', title: 'QQ空间', description: 'QQ 空间动态发布、自动冒泡与评论回复。', group: 'world:qqbot', prefix: 'worlds.qqbot.qzone.', topOnly: false },
-      { id: 'group-speak', title: '群聊限速', description: '限制每个群在单位窗口内被 bot 发出的消息总量，防刷屏/死循环。', group: 'world:qqbot', prefix: 'worlds.qqbot.groupSpeak.', topOnly: false },
+      { id: 'group-speak', title: '群聊限速', description: '群消息进不进来（采样率/采样冷却/点名识别词/推送脚本）与 bot 说多少（窗口内条数）。改完即时生效。', group: 'world:qqbot', prefix: 'worlds.qqbot.groupSpeak.', topOnly: false },
       { id: 'anti-loop', title: '防刷/话题结束', description: '统计单会话 bot 连续发言次数与对方静默时长，超限自动收尾。', group: 'world:qqbot', prefix: 'worlds.qqbot.antiLoop.', topOnly: false },
       { id: 'routine', title: '作息功能', description: '按真实时间切换睡眠/午休/活跃状态，到点播报。', group: 'world:qqbot', prefix: 'worlds.qqbot.routine.', topOnly: false },
       { id: 'reminder', title: '到点提醒', description: '记下的定时提醒到点自动发到对应会话。', group: 'world:qqbot', prefix: 'worlds.qqbot.reminder.', topOnly: false },
@@ -2854,6 +3104,7 @@ export class QQWorld implements World {
             { name: 'qq.activeGroups', description: '正在监听的群列表。', multiline: true },
             { name: 'qq.activePrivates', description: '正在监听的私聊列表。', multiline: true },
             { name: 'qq.unread', description: '未读摘要。' },
+            { name: 'qq.memberBrief', description: '群友档案速查：发言量靠前的人及其口头禅，供参考、不必刻意提起。', multiline: true },
             { name: 'qq.now', description: '当前时间（时区见配置），用于回答"现在几点/星期几/几号"等问题。' },
             { name: 'qq.festival', description: '今天是什么日子：公历/农历节日、二十四节气（按配置时区推算），用于让主动说话自然呼应今天；可能为空（平日无节日）。', multiline: true },
             { name: 'qq.voice', description: '语音能力说明：对方明确要求语音时回复会被转成语音消息，且那正是你自己说的，别误认成对方发的、也别以为没发出去。', multiline: true },
@@ -2865,7 +3116,7 @@ export class QQWorld implements World {
         },
       ],
       links: [],
-      config: [QQ_CONFIG_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP],
+      config: [QQ_CONFIG_GROUP, QQ_DSH_GROUP, QQ_VOICE_GROUP, QQ_ASR_GROUP],
     };
   }
 
@@ -2968,6 +3219,7 @@ export class QQWorld implements World {
   private configGroupById(id: string): { schema?: { title?: string; properties?: Record<string, any> } } | undefined {
     const map: Record<string, any> = {
       'world:qqbot': QQ_CONFIG_GROUP,
+      'world:qqbot-dsh': QQ_DSH_GROUP,
       'world:qqbot-voice': QQ_VOICE_GROUP,
       'world:qqbot-asr': QQ_ASR_GROUP,
     };
@@ -3097,6 +3349,7 @@ export class QQWorld implements World {
       'qq.activeGroups': groupLines,
       'qq.activePrivates': privLines,
       'qq.unread': this.unreadSummary(),
+      'qq.memberBrief': this.memberBrief(),
       'qq.now': `当前时间：${nowStr}（时区 ${this.config.timezone}）。若用户问「现在几点」「今天星期几」「几号了」等，据此回答，不要乱编。`,
       'qq.festival': festivalLine,
       'qq.qzone': qzoneLine,
@@ -3105,6 +3358,38 @@ export class QQWorld implements World {
       'qq.routine': this.routineSegmentText(),
       'qq.voice': voiceLine,
     };
+  }
+
+  /** 群友档案速查：读 /data/home/companion/data/members/index.json + 每人档案，拼成 ≤800 字。 */
+  private memberBriefCache: { key: string; text: string } | null = null;
+  private memberBriefLogged = false;
+  private memberBrief(): string {
+    try {
+      const dir = '/data/home/companion/data/members';
+      const idx = JSON.parse(readFileSync(`${dir}/index.json`, 'utf8')) as Array<{ qq?: string; name: string; msgs: number }>;
+      if (!Array.isArray(idx) || !idx.length) return '';
+      const key = `${idx.length}:${idx[0]?.msgs ?? 0}`;
+      if (this.memberBriefCache && this.memberBriefCache.key === key) return this.memberBriefCache.text;
+
+      const lines = idx.slice(0, 8).map((m) => {
+        try {
+          const p = JSON.parse(readFileSync(`${dir}/${String(m.qq ?? m.name).replace(/[\\/:*?"<>|\s]/g, '_')}.json`, 'utf8')) as { phrases?: Array<{ g: string }> };
+          const ph = (p.phrases ?? []).slice(0, 4).map((x) => x.g).join('/');
+          return `- ${m.name}（${m.qq ?? '?'}）：${m.msgs} 条${ph ? `，常挂嘴边「${ph}」` : ''}`;
+        } catch {
+          return `- ${m.name}（${m.qq ?? '?'}）：${m.msgs} 条`;
+        }
+      });
+      const text = `群友档案（按发言量排序，只作参考，不必刻意提起）：\n${lines.join('\n')}`.slice(0, 800);
+      this.memberBriefCache = { key, text };
+      if (!this.memberBriefLogged) {
+        this.memberBriefLogged = true;
+        this.log.info(`群友档案注入：${idx.length} 人，${text.length} 字`);
+      }
+      return text;
+    } catch {
+      return '';
+    }
   }
 
   private unreadSummary(): string {

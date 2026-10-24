@@ -15,6 +15,9 @@
 ## 未读情况
 {{qq.unread}}
 
+## 群友档案（速查，仅作参考）
+{{qq.memberBrief}}
+
 ## QQ 空间动态（说说）
 {{qq.qzone}}
 
