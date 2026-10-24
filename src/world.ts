@@ -1293,7 +1293,27 @@ export class QQWorld implements World {
     const segs: OneBotSegment[] =
       typeof ev.message === 'string' ? [{ type: 'text', data: { text: ev.message } }] : (ev.message ?? []);
     const selfId = this.identity?.selfId ?? 0;
-    const atMe = segs.some((s) => s.type === 'at' && Number((s as { data: { qq: string } }).data.qq) === selfId);
+    const atMeDirect = segs.some((s) => s.type === 'at' && Number((s as { data: { qq: string } }).data.qq) === selfId);
+
+    // 没有 @、但正文里点了名（昵称/卡片/别名），按 @ 处理：照样推给模型，由模型判断是不是在问它。
+    const plainText = segs
+      .filter((seg) => seg.type === 'text')
+      .map((seg) => String((seg as { data?: { text?: string } }).data?.text ?? ''))
+      .join('');
+    const aliases: string[] = [];
+    const pushAlias = (v: unknown): void => {
+      const t = typeof v === 'string' ? v.trim() : '';
+      if (t.length >= 2 && !aliases.includes(t)) aliases.push(t);
+    };
+    pushAlias(this.identity?.nickname);
+    const configured = (this.config as unknown as { botAliases?: unknown }).botAliases;
+    if (Array.isArray(configured)) for (const a of configured) pushAlias(a);
+    pushAlias('鲸鲸');
+    const nameHit = plainText.length > 0 && aliases.some((a) => plainText.includes(a));
+    if (nameHit && !atMeDirect) {
+      this.log.info('群聊点名按 @ 处理', { alias: aliases.find((a) => plainText.includes(a)) });
+    }
+    const atMe = atMeDirect || nameHit;
 
     // 引用回复
     conv.quotedSenderId = undefined; // 每条消息重新判定，避免沿用上一条旧引用
