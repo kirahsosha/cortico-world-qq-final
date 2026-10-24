@@ -1063,12 +1063,16 @@ export class QQWorld implements World {
     }
     try {
       const res = (await this.driver.callApi('add_custom_face', { file })) as
-        | { emoji_id?: string; data?: { emoji_id?: string } }
+        | { emoji_id?: string; data?: { emoji_id?: string }; result?: number; retcode?: number; errMsg?: string }
         | undefined;
       const eid = res?.emoji_id ?? res?.data?.emoji_id ?? null;
-      if (eid) this.log.info('已加入 QQ 收藏表情', { emojiId: eid, ext });
+      // NapCat 成功时返回 { result: 0, errMsg: '', isExist: 0 }，没有 emoji_id；
+      // 也认 result/retcode=0，并用合成 id 记账，避免 qq_sticker_to_favorites 反复重推同一张。
+      const ok = eid != null || res?.result === 0 || res?.retcode === 0;
+      const id = eid ?? `napcat-${Date.now().toString(36)}`;
+      if (ok) this.log.info('已加入 QQ 收藏表情', { emojiId: id, ext, raw: eid ? undefined : res });
       else this.log.warn('add_custom_face 未返回 emoji_id', { res });
-      return eid ?? null;
+      return ok ? id : null;
     } catch (e) {
       this.log.warn('加入 QQ 收藏表情失败（协议端可能不支持 add_custom_face、共享目录没挂载，或已达上限）', { err: String(e), file });
       return null;
