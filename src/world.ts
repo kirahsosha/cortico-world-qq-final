@@ -1421,6 +1421,28 @@ export class QQWorld implements World {
     // 任意一条历史消息（对齐内置 qq world 的 idTag 渲染）。在自己发消息时 qq_send 的返回里
     // 也会给 message_id，这里补上入站消息，使「引用消息」功能完整闭环。
     const idTag = ev.message_id != null ? `#${ev.message_id} ` : '';
+    // !dsh：主人私聊专用，直接进 DSH 队列，不经过模型（也不算群消息采样）
+    if (conv.kind === 'private' && ['344380045', '2961227626'].includes(String(sender.userId)) && /^[!！]dsh\s+/.test(text)) {
+      const task = text.replace(/^[!！]dsh\s+/, '').trim();
+      if (task) {
+        try {
+          mkdirSync('/data/dsh-inbox', { recursive: true });
+          writeFileSync(`/data/dsh-inbox/${Date.now()}.json`, JSON.stringify({ task, sessionKey: conv.address }), 'utf8');
+          this.log.info('!dsh 已入队', { task: task.slice(0, 40) });
+        } catch (e) {
+          this.log.warn('!dsh 入队失败', { err: String(e) });
+        }
+        try {
+          await this.driver?.callApi('send_msg', {
+            message_type: 'private',
+            user_id: Number(sender.userId),
+            message: [{ type: 'text', data: { text: '收到，已转给 DSH，跑完会把结果发回来。' } }],
+          });
+        } catch { /* ignore */ }
+        return;
+      }
+    }
+
     if (!this.shouldPushEvent(conv.kind, conv.address, atMe)) {
       this.log.info('群消息采样：本条不推给模型', { conv: conv.address });
       return;
