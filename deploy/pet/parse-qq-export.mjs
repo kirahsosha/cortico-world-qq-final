@@ -39,9 +39,13 @@ function collectTxt(p, out) {
 }
 
 function splitSender(raw) {
+  // 形如「昵称(123456)」→ QQ 号
   const m = /^(.*?)[(（](\d{5,12})[)）]\s*$/.exec(raw);
-  if (m) return { sender: m[1].trim() || m[2], qq: m[2] };
-  return { sender: raw.trim(), qq: null };
+  if (m) return { sender: m[1].trim() || m[2], qq: m[2], mail: null };
+  // 形如「昵称<me.liangzehua@gmail.com>」→ 邮箱当唯一 ID（和 QQ 等价）
+  const e = /^(.*?)[<＜]([^<>＜＞\s]+@[^<>＜＞\s]+)[>＞]\s*$/.exec(raw);
+  if (e) return { sender: e[1].trim() || e[2], qq: e[2], mail: e[2] };
+  return { sender: raw.trim(), qq: null, mail: null };
 }
 
 function isoLocal(ts) {
@@ -54,6 +58,13 @@ function isoLocal(ts) {
 async function parseFile(file, onRecord) {
   const rl = createInterface({ input: createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity });
 
+  // 私聊导出里正文行没有 QQ，但文件名是「昵称(QQ号).txt」——从这里拿对方的 QQ
+  let convQq = null;
+  {
+    const m = /\((\d{5,12})\)\.[^.]*$/.exec(file);
+    if (m) convQq = m[1];
+  }
+
   let conv = '';
   let convKind = 'private';
   let cur = null;          // { ts, sender, qq, lines[] }
@@ -64,12 +75,16 @@ async function parseFile(file, onRecord) {
     const text = cur.lines.join('\n').trim();
     const kind = SYSTEM_HINTS.some((h) => text.includes(h)) ? 'system' : 'msg';
     if (text) {
+      // 私聊里「发言人是会话对象本人」时，用文件名里的 QQ 补上
+      const qq = cur.qq || (convKind === 'private' && convQq && cur.sender && conv && cur.sender.includes(conv) ? convQq : null);
       onRecord({
         ts: isoLocal(cur.ts),
         conv,
         convKind,
+        convQq: convQq || null,
         sender: cur.sender,
-        qq: cur.qq,
+        qq,
+        mail: cur.mail || (cur.qq && cur.qq.includes('@') ? cur.qq : null),
         kind,
         text,
       });
@@ -88,8 +103,8 @@ async function parseFile(file, onRecord) {
     const m = START.exec(trimmed);
     if (m) {
       flush();
-      const { sender, qq } = splitSender(m[2]);
-      cur = { ts: m[1], sender, qq, lines: [] };
+      const { sender, qq, mail } = splitSender(m[2]);
+      cur = { ts: m[1], sender, qq, mail, lines: [] };
       inBody = true;
       continue;
     }
