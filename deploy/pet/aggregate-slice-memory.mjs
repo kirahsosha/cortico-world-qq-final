@@ -23,7 +23,7 @@ import { join } from 'node:path';
 
 function parseArgs(argv) {
   const o = {
-    slices: '', convs: [], out: '', maxFacts: 30, maxKnowledge: 24, maxProfileFacts: 40,
+    slices: '', convs: [], out: '', maxFacts: 30, maxKnowledge: 24, maxProfileFacts: 40, identity: '', withRank: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -34,6 +34,8 @@ function parseArgs(argv) {
     else if (a === '--max-facts') o.maxFacts = Math.max(1, Number(next()) || 30);
     else if (a === '--max-knowledge') o.maxKnowledge = Math.max(1, Number(next()) || 24);
     else if (a === '--max-profile-facts') o.maxProfileFacts = Math.max(1, Number(next()) || 40);
+    else if (a === '--identity') o.identity = String(next() || '');
+    else if (a === '--with-rank') o.withRank = true;
     else throw new Error(`未知参数 ${a}`);
   }
   if (!o.slices || !o.out) throw new Error('需要 --slices 和 --out');
@@ -245,6 +247,88 @@ for (const conv of convs) {
 
   report.push({ conv, kind: convKind, factsBefore: before, factsAfter: kept.length, top: kept.slice(0, 5).map((v) => `[${v.count}次] ${v.text}`) });
   console.log(`${conv}: facts ${before} → ${kept.length}，话题 ${topics.length}，人物 ${personFacts.size}`);
+}
+
+/* ---- 身份对照（可选）：把 QQ/邮箱 ↔ 昵称/曾用名 灌进记忆，解决「档案只按号建、正文没名字」 ---- */
+if (opt.identity && existsSync(opt.identity)) {
+  const im = JSON.parse(readFileSync(opt.identity, 'utf8'));
+  const people = im.people || [];
+  const idFacts = [];
+  const byId = new Map();
+  for (const p of people) {
+    byId.set(p.id, p);
+    const aka = (p.names || []).filter((n) => n.name && n.name !== p.latest)
+      .map((n) => `${n.name}(${n.first}~${n.last})`);
+    const akaCount = p.akaCount ?? Math.max(0, (p.names || []).length - 1);
+    // 默认不写「N 个」这种计数：改名次数是派生快照、会随新数据变化，不该当永久事实（v4 已因此被否）
+    const text = opt.withRank
+      ? `昵称对照：${p.latest}（${p.id}）；曾用名 ${akaCount} 个${aka.length ? `，如 ${aka.slice(0, 6).join('、')}${aka.length > 6 ? ' 等' : ''}` : ''}；${(p.convs || []).length} 个会话、${p.msgs} 条`
+      : `昵称对照：${p.latest}（${p.id}）${aka.length ? `；曾用名 ${aka.slice(0, 8).join('、')}${aka.length > 8 ? ' 等' : ''}` : ''}；${(p.convs || []).length} 个会话、${p.msgs} 条`;
+    idFacts.push({
+      hash: shorthash('identity', text),
+      text,
+      confidence: 0.95,
+      createdAt: nowSec,
+      updatedAt: nowSec,
+    });
+  }
+  factScopes.identity = idFacts;
+
+  // 每个会话一条「群友名单」知识，按发言量取前 20
+  const convPeople = new Map();
+  for (const p of people) {
+    for (const c of p.convs || []) {
+      const arr = convPeople.get(c) || [];
+      arr.push(p);
+      convPeople.set(c, arr);
+    }
+  }
+  for (const [c, arr] of convPeople) {
+    if (knowledge.length >= opt.maxKnowledge + 20) break;
+    const top = arr.sort((a, b) => b.msgs - a.msgs).slice(0, 20);
+    knowledge.push({
+      id: Math.random().toString(36).slice(2, 10),
+      topic: `${c} · 群友名单`,
+      keywords: ['名单', 'QQ', '昵称'],
+      facts: top.map((p) => `${p.latest} = ${p.id}`),
+      sources: [`chat:${c}`],
+      learnedAt: nowStr.slice(0, 10),
+      updated: nowStr,
+      hits: top.length,
+    });
+    stats.identityRosters = (stats.identityRosters || 0) + 1;
+  }
+
+  // 改名排行：预计算好，避免模型去翻 51 KB 对照表现数
+  // 改名排行：默认不生成（派生快照，随时会变；要的话 --with-rank，或看 partner/rename-rank.md）
+  const topRenames = opt.withRank
+    ? [...people].sort((a, b) => (b.akaCount ?? 0) - (a.akaCount ?? 0)).slice(0, 10)
+    : [];
+  if (topRenames.length) {
+    knowledge.push({
+      id: Math.random().toString(36).slice(2, 10),
+      topic: '群友改名排行',
+      keywords: ['改名', '群名片', '昵称', '曾用名'],
+      facts: topRenames.map((p, i) => `${i + 1}. ${p.latest}（${p.id}）：曾用名 ${p.akaCount ?? 0} 个`),
+      sources: ['identity'],
+      learnedAt: nowStr.slice(0, 10),
+      updated: nowStr,
+      hits: 1,
+    });
+  }
+
+  // 档案里补昵称（反查「这个号是谁」）
+  let stamped = 0;
+  for (const [qq, prof] of Object.entries(profiles)) {
+    const p = byId.get(qq);
+    if (!p) continue;
+    const aka = (p.names || []).filter((n) => n.name && n.name !== p.latest).map((n) => n.name).slice(0, 5);
+    prof.facts.unshift(`昵称：${p.latest}${aka.length ? `（曾用名：${aka.join('、')}）` : ''}`);
+    stamped += 1;
+  }
+  stats.profileStamped = stamped;
+  stats.identityFacts = idFacts.length;
+  console.log(`身份对照：${idFacts.length} 条事实 + ${stats.identityRosters} 个群名单，档案补昵称 ${stamped} 人`);
 }
 
 const bundle = {
