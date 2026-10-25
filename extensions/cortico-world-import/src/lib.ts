@@ -331,7 +331,12 @@ export function aggregateMembers(records: ChatRecord[], membersDir: string, minM
 
 /** 生成 cortico-memory-export（specVersion 1）里的最小合法包；不写 memory-data.json。 */
 export function buildMemoryExport(membersDir: string, source: string): Record<string, unknown> {
-  const facts: Array<{ fact: string; source: string; timestamp: number }> = [];
+  // 注意：这里输出的是 memory 世界「存储层」的真实形状（fact-store 的 Fact 是
+  // {hash,text,confidence,createdAt,updatedAt}，memory 的四个子字段都是 scope→值 的映射），
+  // 不是文档里的抽象 schema——mem_transfer(import) 会把它原样 merge 进 store。
+  const scope = 'import:members';
+  const now = Math.round(Date.now() / 1000);
+  const texts: string[] = [];
   try {
     const idx = JSON.parse(readFileSync(join(membersDir, 'index.json'), 'utf8')) as IndexRow[];
     for (const m of idx) {
@@ -352,18 +357,25 @@ export function buildMemoryExport(membersDir: string, source: string): Record<st
         l.activeTime ? `活跃：${l.activeTime}` : '',
         `发言 ${p.msgs ?? m.msgs} 条`,
       ].filter(Boolean);
-      facts.push({ fact: b.join('；'), source, timestamp: Date.now() });
+      texts.push(`${b.join('；')}（来源：${source}）`);
     }
   } catch { /* 没有档案就输出空包 */ }
+  const facts = texts.map((text) => ({
+    hash: createHash('sha256').update(`${scope}:${text}`).digest('hex'),
+    text,
+    confidence: 0.8,
+    createdAt: now,
+    updatedAt: now,
+  }));
   return {
     format: 'cortico-memory-export',
     specVersion: 1,
     plugin: 'cortico-world-import',
     exportedAt: new Date().toISOString(),
-    scope: 'all',
+    scope: 'ALL',
     backend: 'json',
-    memory: { store: {}, summary: '', topic: '', notes: [] },
-    facts: { scopes: { 'import:members': facts } },
+    memory: { store: {}, summary: {}, topic: {}, notes: {} },
+    facts: { scopes: { [scope]: facts } },
     vectors: { model: null, vectors: {} },
     knowledge: { entries: [] },
     reflection: { reflections: [], rules: [], stats: {} },

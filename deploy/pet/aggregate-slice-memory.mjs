@@ -1,0 +1,271 @@
+#!/usr/bin/env node
+/**
+ * 把切片分析结果（03-llm/*.jsonl）聚合成 cortico-memory-export，供 mem_transfer(import) 冷启动。
+ *
+ * 只做「聚合」，不调模型：
+ *   - facts：跨切片去重、按「重复次数 + 长期性关键词」排序，每个会话留 N 条
+ *   - knowledge：每个会话按话题聚成条目（topic → facts）
+ *   - profiles：按 QQ 汇总 persona / 口头禅 / 立场 / 习惯
+ *   - aliases：外号单独进 knowledge（「群内称呼」）
+ *
+ * 产物（已按 memory 世界 memory@0.3.1 的存储结构对齐，不是文档里的抽象 schema）：
+ *   facts.scopes[scope] = [{hash,text,confidence,createdAt,updatedAt}]
+ *   knowledge.entries   = [{id,topic,keywords,facts,sources,learnedAt,updated,hits}]
+ *   profiles[qq]        = {facts[], updated}
+ *
+ * 用法：
+ *   node aggregate-slice-memory.mjs --slices tmp/todo5/slices-v2-final/slices-v2-out \
+ *     --convs 为什么一不小心改了群名捏,学弟压榨群,倒爷请给我机会 --out tmp/todo5/memory-export [--max-facts 30]
+ */
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+function parseArgs(argv) {
+  const o = {
+    slices: '', convs: [], out: '', maxFacts: 30, maxKnowledge: 24, maxProfileFacts: 40,
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    const next = () => argv[++i];
+    if (a === '--slices') o.slices = next();
+    else if (a === '--convs') o.convs = String(next() || '').split(',').map((s) => s.trim()).filter(Boolean);
+    else if (a === '--out') o.out = next();
+    else if (a === '--max-facts') o.maxFacts = Math.max(1, Number(next()) || 30);
+    else if (a === '--max-knowledge') o.maxKnowledge = Math.max(1, Number(next()) || 24);
+    else if (a === '--max-profile-facts') o.maxProfileFacts = Math.max(1, Number(next()) || 40);
+    else throw new Error(`未知参数 ${a}`);
+  }
+  if (!o.slices || !o.out) throw new Error('需要 --slices 和 --out');
+  return o;
+}
+
+const norm = (s) => String(s || '').replace(/\s+/g, '').replace(/[。！？!?.，,、；;：:“”"']/g, '').toLowerCase();
+const DURABLE = ['约', '约定', '固定', '总是', '每天', '每周末', '习惯', '喜欢', '爱吃', '不吃', '讨厌', '生日',
+  '住在', '老家', '上班', '工作', '公司', '学校', '专业', '养', '叫', '外号', '称呼', '规则', '必须', '不要',
+  '不能', '过敏', '忌口', '老婆', '老公', '女朋友', '男朋友', '孩子', '爸', '妈'];
+const EPHEMERAL = ['今天', '刚刚', '刚才', '现在', '这次', '目前', '今晚', '明天', '昨天', '等会', '一会儿', '马上'];
+// 隐私：不进记忆（宁可丢，不可存）
+const PII = [
+  /验证码|动态码|密码|身份证|银行卡|卡号|护照|社保/,
+  /\b1[3-9]\d{9}\b/,
+  /\d{6}\s*(?:是|为)?\s*(?:验证码|动态码)/,
+  /(?:省|市|区|县).{0,12}(?:路|街|道|弄).{0,12}(?:号|室|楼)/,
+  /[\w.+-]+@[\w-]+\.[\w.]+/,
+  /\b\d{17}[\dXx]\b/,
+];
+const isPrivate = (text) => PII.some((re) => re.test(String(text)));
+
+function scoreFact(text, count) {
+  const t = String(text);
+  const durable = DURABLE.filter((k) => t.includes(k)).length;
+  const ephemeral = EPHEMERAL.filter((k) => t.startsWith(k) || t.includes('今天')).length;
+  let score = count * 2 + durable * 3 + Math.min(t.length, 40) / 20;
+  if (ephemeral && count === 1) score -= 4;
+  return { score, durable, ephemeral };
+}
+
+const shorthash = (scope, text) => createHash('sha256').update(`${scope}:${text}`).digest('hex');
+
+const opt = parseArgs(process.argv.slice(2));
+const nowSec = Math.round(Date.now() / 1000);
+const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+const convs = opt.convs.length ? opt.convs : readdirSync(opt.slices).filter((d) => statSync(join(opt.slices, d)).isDirectory() && d !== '_templates');
+const report = [];
+const factScopes = {};
+const knowledge = [];
+const profiles = {};
+const stats = { convs: [], factsBefore: 0, factsAfter: 0, knowledge: 0, profiles: 0, piiDropped: 0, idReplaced: 0, datedDropped: 0 };
+
+/** 把事实里的 QQ 号换成「昵称」，读起来像人话；只替换本会话身份表里确实存在的号 */
+function makeBeautifier(identityFile) {
+  const map = new Map();
+  try {
+    const list = JSON.parse(readFileSync(identityFile, 'utf8'));
+    for (const p of list) {
+      const names = (p.names || []).map((n) => n.name);
+      const name = names.length ? names[names.length - 1] : '';
+      if (name) map.set(String(p.qq), name);
+    }
+  } catch { /* 没有身份表就不替换 */ }
+  return (text) => {
+    let out = String(text);
+    for (const [qq, name] of map) {
+      if (qq.length < 5 || !out.includes(qq)) continue;
+      out = out.split(qq).join(name);
+      stats.idReplaced += 1;
+    }
+    return out;
+  };
+}
+
+for (const conv of convs) {
+  const dir = join(opt.slices, conv);
+  if (!existsSync(join(dir, '03-llm'))) { console.log('跳过（无 03-llm）', conv); continue; }
+  const convKind = JSON.parse(readFileSync(join(dir, '99-manifest.json'), 'utf8')).kind;
+  const beautify = makeBeautifier(join(dir, '00-identity.json'));
+
+  // sliceId → meta（person 切片的 qq、时间切片的 start）
+  const sliceMeta = new Map();
+  for (const f of readdirSync(join(dir, '01-slices'))) {
+    if (!f.endsWith('.jsonl')) continue;
+    for (const l of readFileSync(join(dir, '01-slices', f), 'utf8').split('\n').filter(Boolean)) {
+      const s = JSON.parse(l);
+      sliceMeta.set(s.sliceId, { type: s.type, start: s.start, meta: s.meta || {} });
+    }
+  }
+
+  // 收集 facts / topics / person 信息
+  const factMap = new Map(); // norm -> {text, count, dates:Set, types:Set}
+  const topicCount = new Map();
+  const personFacts = new Map(); // qq -> Set
+  let before = 0;
+
+  for (const f of readdirSync(join(dir, '03-llm'))) {
+    const type = f.replace(/\.jsonl$/, '');
+    for (const l of readFileSync(join(dir, '03-llm', f), 'utf8').split('\n').filter(Boolean)) {
+      const o = JSON.parse(l);
+      if (!o.ok) continue;
+      const p = o.parsed || {};
+      const meta = sliceMeta.get(o.sliceId) || {};
+      const date = String(meta.start || '').slice(0, 10);
+      for (const x of p.facts || []) {
+        if (typeof x !== 'string' || x.trim().length < 4) continue;
+        before += 1;
+        if (isPrivate(x)) { stats.piiDropped = (stats.piiDropped || 0) + 1; continue; }
+        const text = beautify(x);
+        const k = norm(text);
+        const cur = factMap.get(k) || { text: text.trim(), count: 0, dates: new Set(), types: new Set() };
+        cur.count += 1;
+        if (date) cur.dates.add(date);
+        cur.types.add(type);
+        factMap.set(k, cur);
+      }
+      for (const t of p.topics || []) if (typeof t === 'string' && t.trim()) topicCount.set(t.trim(), (topicCount.get(t.trim()) || 0) + 1);
+      if (type === 'person') {
+        const qq = meta.meta?.qq;
+        if (qq) {
+          const set = personFacts.get(qq) || new Set();
+          if (p.persona) set.add(`画像：${p.persona}`);
+          for (const c of p.catchphrases || []) set.add(`口头禅：${c}`);
+          for (const s of p.stance || []) set.add(`观点：${s}`);
+          for (const h of p.habits || []) set.add(`习惯：${h}`);
+          personFacts.set(qq, set);
+        }
+      }
+    }
+  }
+
+  // 评分 + 过滤 + 去重（包含关系：留长的，计数相加）
+  const scored = [...factMap.values()]
+    .map((v) => {
+      const { score, durable, ephemeral } = scoreFact(v.text, v.count);
+      return { ...v, score, durable, ephemeral };
+    })
+    .filter((v) => !(v.ephemeral && v.count === 1 && v.text.length < 26))
+    // 「2026-07-04 夜 某人…」这种一次性事件，只有出现过一次、又没有长期性关键词，就不进记忆
+    .filter((v) => {
+      const dated = /^\d{4}-\d{2}-\d{2}/.test(v.text);
+      const sticky = /约定|生日|固定|每天|每周|总是|习惯/.test(v.text);
+      if (dated && v.count === 1 && !sticky) { stats.datedDropped += 1; return false; }
+      return true;
+    })
+    .sort((a, b) => b.score - a.score);
+  const kept = [];
+  for (const v of scored) {
+    if (kept.some((k) => norm(k.text).includes(norm(v.text)) || norm(v.text).includes(norm(k.text)))) continue;
+    kept.push(v);
+    if (kept.length >= opt.maxFacts) break;
+  }
+
+  const scope = `chat:${conv}`;
+  factScopes[scope] = kept.map((v) => ({
+    hash: shorthash(scope, v.text),
+    text: v.text,
+    confidence: Math.min(1, 0.6 + Math.min(0.35, (v.count - 1) * 0.1 + v.durable * 0.05)),
+    createdAt: nowSec,
+    updatedAt: nowSec,
+  }));
+  stats.factsBefore += before;
+  stats.factsAfter += kept.length;
+
+  // knowledge：每个会话按高频话题聚一条
+  const topics = [...topicCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  for (const [topic, cnt] of topics) {
+    if (knowledge.length >= opt.maxKnowledge) break;
+    // 话题关联用「过滤前的全部 fact」，否则 30 条 kept 里很少正好提到某个话题
+    const related = scored.filter((v) => v.text.includes(topic)).slice(0, 5).map((v) => v.text);
+    if (related.length < 2) continue;
+    if (!related.length) continue;
+    knowledge.push({
+      id: Math.random().toString(36).slice(2, 10),
+      topic: `${conv} · ${topic}`,
+      keywords: [topic],
+      facts: related,
+      sources: [scope],
+      learnedAt: nowStr.slice(0, 10),
+      updated: nowStr,
+      hits: cnt,
+    });
+  }
+
+  // profiles：按 QQ 汇总
+  for (const [qq, set] of personFacts) {
+    const list = [...set].slice(0, opt.maxProfileFacts);
+    if (!list.length) continue;
+    profiles[qq] = { facts: list, updated: nowSec };
+    stats.profiles += 1;
+  }
+
+  report.push({ conv, kind: convKind, factsBefore: before, factsAfter: kept.length, top: kept.slice(0, 5).map((v) => `[${v.count}次] ${v.text}`) });
+  console.log(`${conv}: facts ${before} → ${kept.length}，话题 ${topics.length}，人物 ${personFacts.size}`);
+}
+
+const bundle = {
+  format: 'cortico-memory-export',
+  specVersion: 1,
+  plugin: 'cortico-world-import',
+  exportedAt: new Date().toISOString(),
+  scope: 'ALL',
+  backend: 'json',
+  memory: { store: {}, summary: {}, topic: {}, notes: {} },
+  facts: { scopes: factScopes },
+  vectors: { model: null, vectors: {} },
+  knowledge: { entries: knowledge },
+  reflection: { reflections: [], rules: [], stats: {} },
+  persona: { personas: {}, globalStyle: '' },
+  profiles,
+};
+
+mkdirSync(opt.out, { recursive: true });
+const file = join(opt.out, `memory-export-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+writeFileSync(file, `${JSON.stringify(bundle, null, 2)}\n`, 'utf8');
+stats.knowledge = knowledge.length;
+stats.profiles = Object.keys(profiles).length;
+stats.scopes = Object.keys(factScopes).length;
+stats.file = file;
+
+// 结构自检：hash 必须等于 sha256(scope:text)；字段类型要能被 memory 世界直接读
+const problems = [];
+for (const [scope, list] of Object.entries(factScopes)) {
+  for (const f of list) {
+    if (!f.hash || !f.text || typeof f.confidence !== 'number' || typeof f.createdAt !== 'number') problems.push(`fact 字段缺失 ${scope}`);
+    else if (f.hash !== shorthash(scope, f.text)) problems.push(`fact hash 不匹配 ${scope}`);
+  }
+}
+for (const e of knowledge) {
+  if (!e.id || !e.topic || !Array.isArray(e.facts) || !Array.isArray(e.keywords) || !Array.isArray(e.sources)) problems.push(`knowledge 字段缺失 ${e.topic}`);
+  for (const k of ['learnedAt', 'updated']) if (typeof e[k] !== 'string') problems.push(`knowledge.${k} 类型错 ${e.topic}`);
+}
+for (const [qq, p] of Object.entries(profiles)) {
+  if (!Array.isArray(p.facts) || typeof p.updated !== 'number') problems.push(`profile 字段缺失 ${qq}`);
+}
+stats.validation = problems.length ? { ok: false, problems: problems.slice(0, 5) } : { ok: true };
+writeFileSync(join(opt.out, 'report.json'), `${JSON.stringify({ stats, report }, null, 2)}\n`, 'utf8');
+if (problems.length) console.log(`结构自检失败：${problems.slice(0, 3).join('; ')}`);
+else console.log('结构自检：通过');
+
+console.log(`\nfacts: ${stats.factsBefore} → ${stats.factsAfter}（${stats.scopes} 个 scope）`);
+console.log(`knowledge: ${stats.knowledge} 条；profiles: ${stats.profiles} 人`);
+console.log(`-> ${file}`);
