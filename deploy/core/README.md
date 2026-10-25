@@ -27,3 +27,12 @@ docker cp backup/boot-<ts>.ts coopanion:/opt/Coopanion/resources/app/core/boot.t
 - 关掉 inspector：`docker exec -u 0 coopanion rm /data/logs/.inspect-on` 后重启（端口只在容器内可达）
 - 自愈会先抓 profile 再重启；`watchdog.log` 里能看到 `已保存 CPU profile /data/logs/hang-*.cpuprofile`
 - 分析 profile：Chrome DevTools → Performance → Load profile，或 `node --prof-process`（需转格式）
+
+## read_file 单次上限（2026-10-25 加）
+
+- `workspaceTools.ts`：`READ_FILE_MAX_CHARS = 12000`、`READ_FILE_HEAD_CHARS = 3000`
+  - 不带 offset/limit 且文件超过 12000 字符 → 只回开头 3000 字 + 提示「用 grep_files 或分段读」
+  - 带 offset/limit 但切片仍超 12000 → 截断并提示
+  - 工具描述里也写明「single read is capped at 12000 chars」
+- `ENV_PROMPT.md` 加「## 查文件（重要）」：查人/日期用 grep，统计类不要靠读文件数，量大可以直接不读、凭记忆答或说「得慢慢查」
+- 部署后需要 `POST /api/session/reload-prefix` 让当前 session 立刻用上新前缀
