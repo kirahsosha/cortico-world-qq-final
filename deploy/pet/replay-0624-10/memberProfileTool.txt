@@ -1,0 +1,20 @@
+    const memberProfileTool: ToolDef = {
+      name: 'qq_member_profile',
+      tags: ['read'],
+      barrierAfter: true,
+      description:
+        '查单个群友的完整档案：画像、口头禅、常聊话题、语气、人际关系、活跃时段、高频片段。\n' +
+        '参数 who 传 QQ 号或昵称（可以只给昵称的一部分，如「倒爷」）。\n' +
+        '当有人问「XX 是个什么样的人」「XX 爱说什么/口头禅是什么」，或你要针对某个群友说话、接梗时，先调本工具，别凭印象编。',
+      parameters: {
+        type: 'object',
+        properties: { who: { type: 'string', description: 'QQ 号或昵称（可用昵称的一部分）。' } },
+        required: ['who'],
+      },
+      handler: async (args) => {
+        this.log.info('调用 qq_member_profile');
+        const who = typeof args.who === 'string' ? args.who : '';
+        return this.memberProfile(who);
+      },
+    };
+

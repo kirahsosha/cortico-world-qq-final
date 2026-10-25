@@ -1,0 +1,33 @@
+  /** 群友档案速查：读 /data/home/companion/data/members/index.json + 每人 llm.summary，8 人约 400 字。 */
+  private memberBriefLogged = false;
+  private memberBrief(): string {
+    try {
+      const dir = '/data/home/companion/data/members';
+      const idx = JSON.parse(readFileSync(`${dir}/index.json`, 'utf8')) as Array<{ qq?: string; name: string; msgs: number }>;
+      if (!Array.isArray(idx) || !idx.length) return '';
+      const lines = idx.slice(0, 8).map((m) => {
+        const safe = String(m.qq ?? m.name).replace(/[\\/:*?"<>|\s]/g, '_');
+        try {
+          const p = JSON.parse(readFileSync(`${dir}/${safe}.json`, 'utf8')) as {
+            llm?: { summary?: string };
+            phrases?: Array<{ g: string }>;
+          };
+          const summary = (p.llm?.summary ?? '').trim();
+          if (summary) return `- ${m.name}（${m.qq ?? '?'}）：${summary}`;
+          const ph = (p.phrases ?? []).slice(0, 4).map((x) => x.g).join('/');
+          return `- ${m.name}（${m.qq ?? '?'}）：${m.msgs} 条${ph ? `，常挂嘴边「${ph}」` : ''}`;
+        } catch {
+          return `- ${m.name}（${m.qq ?? '?'}）：${m.msgs} 条`;
+        }
+      });
+      const text = `群友档案（按发言量排序，只作参考，不必刻意提起；要看某人完整档案可调 qq_member_profile）：\n${lines.join('\n')}`.slice(0, 1000);
+      if (!this.memberBriefLogged) {
+        this.memberBriefLogged = true;
+        this.log.info(`群友档案注入：${idx.length} 人，${text.length} 字（llm.summary 模式）`);
+      }
+      return text;
+    } catch {
+      return '';
+    }
+  }
+

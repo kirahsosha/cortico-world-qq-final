@@ -1,0 +1,49 @@
+  /** 单人完整档案：按 QQ 号或昵称查 members/index.json + <key>.json，返回可读文本。 */
+  private memberProfile(who: string): string {
+    try {
+      const dir = '/data/home/companion/data/members';
+      const idx = JSON.parse(readFileSync(`${dir}/index.json`, 'utf8')) as Array<{ qq?: string | null; name: string; msgs: number; last?: string }>;
+      if (!Array.isArray(idx) || !idx.length) return '还没有群友档案（members/index.json 为空）。';
+      const q = who.trim();
+      if (!q) return '请提供 QQ 号或昵称（可以是昵称的一部分）。';
+      const qLower = q.toLowerCase();
+      let hits = idx.filter((m) => String(m.qq ?? '') === q);
+      if (!hits.length) hits = idx.filter((m) => m.name.includes(q) || q.includes(m.name));
+      if (!hits.length) hits = idx.filter((m) => m.name.toLowerCase().includes(qLower));
+      if (!hits.length) return `没找到「${q}」的档案；试试群友档案速查里出现过的名字。`;
+      const m = hits[0];
+      const safe = String(m.qq ?? m.name).replace(/[\\/:*?"<>|\s]/g, '_');
+      const p = JSON.parse(readFileSync(`${dir}/${safe}.json`, 'utf8')) as {
+        names?: string[];
+        msgs?: number;
+        avgLen?: number;
+        activeHours?: number[];
+        phrases?: Array<{ g: string; n: number }>;
+        llm?: {
+          summary?: string;
+          catchphrases?: string[];
+          topics?: string[];
+          tone?: string;
+          relations?: Array<{ who: string; how: string }>;
+          activeTime?: string;
+        };
+      };
+      const l = p.llm ?? {};
+      const alias = (p.names ?? []).filter((n) => n && n !== m.name).slice(0, 5);
+      const lines: string[] = [];
+      lines.push(`【${m.name}（QQ ${m.qq ?? '未知'}）】${alias.length ? `曾用名/别名：${alias.join('、')}` : ''}`);
+      if (l.summary) lines.push(`画像：${l.summary}`);
+      if (l.catchphrases && l.catchphrases.length) lines.push(`口头禅：${l.catchphrases.join(' / ')}`);
+      if (l.topics && l.topics.length) lines.push(`常聊：${l.topics.join(' / ')}`);
+      if (l.tone) lines.push(`语气：${l.tone}`);
+      if (l.relations && l.relations.length) lines.push(`关系：${l.relations.map((r) => `${r.who}（${r.how}）`).join('；')}`);
+      if (l.activeTime) lines.push(`活跃：${l.activeTime}`);
+      lines.push(`数据：${p.msgs ?? m.msgs} 条，平均 ${p.avgLen ?? '?'} 字/条${p.activeHours && p.activeHours.length ? `，主要活跃 ${p.activeHours.join('/')} 点` : ''}`);
+      if (p.phrases && p.phrases.length) lines.push(`高频片段：${p.phrases.slice(0, 8).map((x) => `${x.g}(${x.n})`).join(' ')}`);
+      if (!l.summary) lines.push('（该成员还没有 LLM 画像，以上只有统计信息。）');
+      return lines.join('\n');
+    } catch {
+      return '读取群友档案失败（文件缺失或格式不对）。';
+    }
+  }
+
