@@ -39,6 +39,11 @@ function parseArgs(argv) {
     provider: '/data/home/providers/deepseek',
     model: '',
     limit: 0,
+    since: '',
+    countOnly: false,
+    olderCap: null,
+    capByType: {},
+    atWithReply: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -57,6 +62,15 @@ function parseArgs(argv) {
     else if (a === '--provider') o.provider = next();
     else if (a === '--model') o.model = next();
     else if (a === '--limit') o.limit = Math.max(0, Number(next()) || 0);
+    else if (a === '--since') o.since = String(next() || '').replace(' ', 'T');
+    else if (a === '--count-only') o.countOnly = true;
+    else if (a === '--older-cap') o.olderCap = Math.max(0, Number(next()) || 0);
+    else if (a === '--at-with-reply') o.atWithReply = true;
+    else if (a.startsWith('--cap-')) {
+      const t = a.slice('--cap-'.length);
+      if (!['time', 'person', 'at', 'alias'].includes(t)) throw new Error(`未知参数: ${a}`);
+      o.capByType[t] = Math.max(0, Number(next()) || 0);
+    }
     else if (a === '--help' || a === '-h') { console.log('see header'); process.exit(0); }
     else throw new Error(`未知参数: ${a}`);
   }
@@ -236,6 +250,11 @@ function sliceAt(msgs, opt) {
   const seen = new Set();
   for (let i = 0; i < sorted.length; i += 1) {
     if (!sorted[i].text.includes('@')) continue;
+    // 只要「被 @ 后有人回应」的片段（一次性的 @ 信息量低）
+    if (opt.atWithReply) {
+      const replied = sorted.slice(i + 1, i + 10).some((x) => x.qq !== sorted[i].qq && minutes(sorted[i], x) <= 5);
+      if (!replied) continue;
+    }
     const key = Math.floor(new Date(sorted[i].ts).getTime() / 300000);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -731,11 +750,11 @@ for (const conv of targets) {
   if (!msgs.length) continue;
   const convKind = msgs[0].convKind;
   const dir = join(outRoot, slug(conv));
-  for (const d of ['', '01-slices', '02-prompts', '03-llm']) mkdirSync(join(dir, d), { recursive: true });
+  if (!opt.countOnly) for (const d of ['', '01-slices', '02-prompts', '03-llm']) mkdirSync(join(dir, d), { recursive: true });
   console.log(`\n--- ${conv}（${convKind}，${msgs.length} 条）`);
 
   // 00 原始记录 + 身份表
-  writeFileSync(join(dir, '00-records.jsonl'), msgs.map((m) => JSON.stringify(m)).join('\n') + '\n', 'utf8');
+  if (!opt.countOnly) writeFileSync(join(dir, '00-records.jsonl'), msgs.map((m) => JSON.stringify(m)).join('\n') + '\n', 'utf8');
   const people = new Map();
   for (const m of msgs) {
     if (!m.qq) continue;
@@ -748,7 +767,7 @@ for (const conv of targets) {
     p.names.set(m.sender, nm);
     people.set(m.qq, p);
   }
-  writeFileSync(join(dir, '00-identity.json'), JSON.stringify([...people.values()].map((p) => ({
+  if (!opt.countOnly) writeFileSync(join(dir, '00-identity.json'), JSON.stringify([...people.values()].map((p) => ({
     qq: p.qq, n: p.n,
     names: [...p.names.entries()].sort((a, b) => a[1].first.localeCompare(b[1].first)).map(([n, v]) => ({ name: n, ...v })),
   })), null, 2), 'utf8');
@@ -759,8 +778,21 @@ for (const conv of targets) {
     // 私聊不切 @
     if (type === 'at' && convKind === 'private') { convStat.types[type] = { skipped: 'private' }; continue; }
     const builder = type === 'time' ? sliceTime : type === 'person' ? slicePerson : type === 'at' ? sliceAt : sliceAlias;
-    const { slices, total } = builder(msgs, { ...opt, knownNames, knownPrefixes, knownNameList, resolve: ident.resolve });
-    const take = sampleSlices(slices, opt.cap);
+    const built = builder(msgs, { ...opt, knownNames, knownPrefixes, knownNameList, resolve: ident.resolve });
+    const total = built.total;
+    const slices = built.slices;
+    const capFor = opt.capByType[type] ?? opt.cap;
+    const recent = opt.since ? slices.filter((s) => s.msgs[0].ts >= opt.since) : [];
+    const older = opt.since ? slices.filter((s) => s.msgs[0].ts < opt.since) : slices;
+    if (opt.countOnly) {
+      console.log(`  ${type}: 全量 ${slices.length} 段，${opt.since ? `since ${opt.since.slice(0, 10)} 之后 ${recent.length} 段 / 之前 ${older.length} 段` : `命中 ${slices.length} 段`}`);
+      convStat.types[type] = { total: slices.length, recent: recent.length, older: older.length };
+      continue;
+    }
+    // 近段全读 + 旧段按类型 cap 抽样
+    const take = opt.since
+      ? [...sampleSlices(older, opt.olderCap ?? capFor), ...recent]
+      : sampleSlices(slices, capFor);
     // 锚点清单（全量，便于检查切了哪些锚点）
     const anchorSummary = {};
     for (const s of slices) {
@@ -795,7 +827,7 @@ for (const conv of targets) {
       const ptype = s.type === 'mention' ? 'mention' : type;
       writeFileSync(join(md, `${s.sliceId}.md`), buildPrompt(ptype, s, { gap: opt.gap, personBlock: opt.personBlock, qqNames, latestName }), 'utf8');
     }
-    convStat.types[type] = { total: slices.length, anchors: total, sliced: outSlices.length, capped: slices.length > opt.cap };
+    convStat.types[type] = { total: slices.length, anchors: total, sliced: outSlices.length, capped: take.length < slices.length, recent: recent.length, older: older.length };
     console.log(`  ${type}: 粗切 ${slices.length} 段，落盘 ${outSlices.length} 段（prompt 已写）`);
   }
 
@@ -849,7 +881,7 @@ for (const conv of targets) {
     }
   }
 
-  writeFileSync(join(dir, '99-manifest.json'), JSON.stringify(convStat, null, 2), 'utf8');
+  if (!opt.countOnly) writeFileSync(join(dir, '99-manifest.json'), JSON.stringify(convStat, null, 2), 'utf8');
   manifest.convs.push(convStat);
 }
 
