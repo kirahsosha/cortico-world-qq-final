@@ -117,7 +117,7 @@ for (const conv of convs) {
   }
 
   // 收集 facts / topics / person 信息
-  const factMap = new Map(); // norm -> {text, count, dates:Set, types:Set}
+  const factMap = new Map(); // norm -> {text, count, dates:Set, types:Set, people:Set, topics:Set}
   const topicCount = new Map();
   const personFacts = new Map(); // qq -> Set
   let before = 0;
@@ -130,16 +130,21 @@ for (const conv of convs) {
       const p = o.parsed || {};
       const meta = sliceMeta.get(o.sliceId) || {};
       const date = String(meta.start || '').slice(0, 10);
+      // 这段切片里有哪些人、在聊什么（用于给「约定/事件」类事实补主语）
+      const people = [...new Set((p.participants || []).map((x) => beautify(String(x.name || ''))).filter(Boolean))].slice(0, 4);
+      const sliceTopic = typeof p.topic === 'string' ? p.topic.slice(0, 20) : '';
       for (const x of p.facts || []) {
         if (typeof x !== 'string' || x.trim().length < 4) continue;
         before += 1;
         if (isPrivate(x)) { stats.piiDropped = (stats.piiDropped || 0) + 1; continue; }
         const text = beautify(x);
         const k = norm(text);
-        const cur = factMap.get(k) || { text: text.trim(), count: 0, dates: new Set(), types: new Set() };
+        const cur = factMap.get(k) || { text: text.trim(), count: 0, dates: new Set(), types: new Set(), people: new Set(), topics: new Set() };
         cur.count += 1;
         if (date) cur.dates.add(date);
         cur.types.add(type);
+        for (const n of people) cur.people.add(n);
+        if (sliceTopic) cur.topics.add(sliceTopic);
         factMap.set(k, cur);
       }
       for (const t of p.topics || []) if (typeof t === 'string' && t.trim()) topicCount.set(t.trim(), (topicCount.get(t.trim()) || 0) + 1);
@@ -180,22 +185,42 @@ for (const conv of convs) {
   }
 
   const scope = `chat:${conv}`;
-  factScopes[scope] = kept.map((v) => ({
-    hash: shorthash(scope, v.text),
-    text: v.text,
-    confidence: Math.min(1, 0.6 + Math.min(0.35, (v.count - 1) * 0.1 + v.durable * 0.05)),
-    createdAt: nowSec,
-    updatedAt: nowSec,
-  }));
+  // 「约定/事件」类事实补上在场人和话题，否则只记了「几点开战」不知道跟谁
+  const EVENT = /约定|约了|约好|生日|聚会|聚餐|开战|几点|点见|碰头|见面|^\d{4}-\d{2}-\d{2}/;
+  const enrich = (v) => {
+    if (!EVENT.test(v.text)) return v.text;
+    const people = [...v.people].filter((n) => n && !v.text.includes(n)).slice(0, 3);
+    const topic = [...v.topics][0] || '';
+    const extra = [];
+    if (people.length) extra.push(`在场：${people.join('、')}`);
+    if (topic && !v.text.includes(topic)) extra.push(`话题：${topic}`);
+    if (!extra.length) return v.text;
+    stats.enriched = (stats.enriched || 0) + 1;
+    return `${v.text}（${extra.join('；')}）`;
+  };
+  factScopes[scope] = kept.map((v) => {
+    const text = enrich(v);
+    return {
+      hash: shorthash(scope, text),
+      text,
+      confidence: Math.min(1, 0.6 + Math.min(0.35, (v.count - 1) * 0.1 + v.durable * 0.05)),
+      createdAt: nowSec,
+      updatedAt: nowSec,
+    };
+  });
   stats.factsBefore += before;
   stats.factsAfter += kept.length;
 
-  // knowledge：每个会话按高频话题聚一条
-  const topics = [...topicCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  // knowledge：每个会话按高频话题聚一条（过滤「游戏/吃饭」这类过泛话题）
+  const GENERIC = new Set(['游戏', '吃饭', '吃喝', '聊天', '日常', '生活', '群聊', '闲聊', '发图', '表情包', '视频', '音乐', '抽卡']);
+  const topics = [...topicCount.entries()]
+    .filter(([t]) => t.length >= 2 && !GENERIC.has(t))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4);
   for (const [topic, cnt] of topics) {
     if (knowledge.length >= opt.maxKnowledge) break;
     // 话题关联用「过滤前的全部 fact」，否则 30 条 kept 里很少正好提到某个话题
-    const related = scored.filter((v) => v.text.includes(topic)).slice(0, 5).map((v) => v.text);
+    const related = scored.filter((v) => v.text.includes(topic)).slice(0, 5).map((v) => enrich(v));
     if (related.length < 2) continue;
     if (!related.length) continue;
     knowledge.push({
