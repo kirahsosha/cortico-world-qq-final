@@ -817,7 +817,18 @@ for (const conv of targets) {
           const s = slices[i];
           const prompt = buildPrompt(type === 'person' ? 'person' : (s.type === 'mention' ? 'mention' : type), s, { gap: opt.gap, personBlock: opt.personBlock, qqNames, latestName });
           try {
-            const r = await callModel(prov, prompt);
+            let r = null;
+            let lastErr = null;
+            for (let attempt = 1; attempt <= 2 && !r; attempt += 1) {
+              try {
+                const p2 = attempt === 1 ? prompt : `${prompt}\n\n（上次输出不是合法 JSON，请只输出 JSON 对象，不要解释。）`;
+                r = await callModel(prov, p2);
+              } catch (e) {
+                lastErr = e;
+                if (attempt === 1) await new Promise((res) => setTimeout(res, 1200));
+              }
+            }
+            if (!r) throw lastErr || new Error('unknown');
             totalCalls += 1;
             totalIn += r.usage.prompt_tokens || 0;
             totalOut += r.usage.completion_tokens || 0;
