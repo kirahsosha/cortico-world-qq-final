@@ -94,6 +94,16 @@ export interface QQWorldConfig {
     addToQQFavorites: boolean;
     /** 协议端（NapCat 容器）能读到的共享目录：add_custom_face 只认真实文件路径。 */
     sharedDir: string;
+    /** 预筛：PNG/JPG 体积上限（KB），超过直接丢（不送视觉，省钱）。0=不限制。 */
+    maxKBJpg: number;
+    /** 预筛：GIF 体积上限（KB）。动画表情天然偏大，默认放宽到 3MB。0=不限制。 */
+    maxKBGif: number;
+    /** 预筛：长边上限（像素）。0=不限制。 */
+    maxEdge: number;
+    /** 预筛：长宽比下限（宽/高）。0=不限制。 */
+    minRatio: number;
+    /** 预筛：长宽比上限。0=不限制。 */
+    maxRatio: number;
   };
   /** 主动说话调度器：后台按状态机向监听会话主动冒泡闲聊（事件驱动：只推 nudge，由主模型生成发送，不再用第二模型）。 */
   proactive: {
@@ -304,6 +314,12 @@ export const QQ_DEFAULTS: QQWorldConfig = {
     dir: '',
     addToQQFavorites: false,
     sharedDir: '/shared',
+    // 标注前的尺寸/体积预筛（面板暂未暴露，改 config.json 即可生效）
+    maxKBJpg: 800,
+    maxKBGif: 3072,
+    maxEdge: 1024,
+    minRatio: 0.5,
+    maxRatio: 2.0,
   },
   proactive: {
     enabled: false,
@@ -473,6 +489,49 @@ export const QQ_CONFIG_GROUP: ConfigGroup = {
         enum: ['sticker', 'allImages'],
         'x-hot': false,
         description: 'sticker=仅 OneBot 表情包段；allImages=所有图片都当表情候选收藏。',
+      },
+      'worlds.qqbot.sticker.maxKBJpg': {
+        type: 'integer',
+        title: '预筛·PNG/JPG 体积上限',
+        minimum: 0,
+        maximum: 51200,
+        'x-suffix': 'KB',
+        'x-hot': false,
+        description: '标注前的体积预筛：超过这个大小的 PNG/JPG 直接丢弃，不送视觉（省钱）。0 = 不限制。注意：OneBot 表情段或 summary 带「表情/贴纸」的图会跳过预筛。默认 800。',
+      },
+      'worlds.qqbot.sticker.maxKBGif': {
+        type: 'integer',
+        title: '预筛·GIF 体积上限',
+        minimum: 0,
+        maximum: 51200,
+        'x-suffix': 'KB',
+        'x-hot': false,
+        description: '动画表情天生偏大，GIF 单独放宽。0 = 不限制。默认 3072（3MB）。',
+      },
+      'worlds.qqbot.sticker.maxEdge': {
+        type: 'integer',
+        title: '预筛·长边上限',
+        minimum: 0,
+        maximum: 16384,
+        'x-suffix': 'px',
+        'x-hot': false,
+        description: '图片长边超过这个像素就丢弃（表情包通常很小，截图/照片都很大）。0 = 不限制。默认 1024。',
+      },
+      'worlds.qqbot.sticker.minRatio': {
+        type: 'number',
+        title: '预筛·长宽比下限',
+        minimum: 0,
+        maximum: 10,
+        'x-hot': false,
+        description: '宽÷高 的下限。竖长图（长截图、手机截图）会低于它。0 = 不限制。默认 0.5。',
+      },
+      'worlds.qqbot.sticker.maxRatio': {
+        type: 'number',
+        title: '预筛·长宽比上限',
+        minimum: 0,
+        maximum: 10,
+        'x-hot': false,
+        description: '宽÷高 的上限。游戏/桌面截图通常是 16:9（≈1.78），一般不会超。0 = 不限制。默认 2。',
       },
       'worlds.qqbot.sticker.sharedDir': { type: 'string', title: '共享目录', 'x-hot': true, description: 'NapCat 容器也挂载了的目录（两侧路径要一致，默认 /shared）。add_custom_face 只接受真实文件路径，图片会先落到这里再把路径交给协议端。' },
       'worlds.qqbot.sticker.addToQQFavorites': { type: 'boolean', title: '同步到 QQ 收藏表情', 'x-hot': true, description: '开启后，bot 每收藏一张表情包都会同时加入登录账号的 QQ「收藏表情」（custom face），你能在 QQ 客户端里直接看到/使用。依赖协议端支持 add_custom_face（如 SnowLuma）；不支持时自动降级（仍存盘，但不进 QQ）。注意 QQ 收藏表情有数量上限，超出会失败（可用 qq_sticker_to_favorites 的结果看到哪些没加进去）。' },
@@ -679,6 +738,17 @@ export function toIds(raw: unknown): number[] {
   return [];
 }
 
+/**
+ * 取数字配置：空/非数字/NaN/负数一律回默认值；**0 保留**（约定 0 = 不限制）。
+ * 用于 sticker 的预筛阈值——这些项面板还没暴露，用户手改 config.json 时容易写错类型。
+ */
+function numOr(v: unknown, def: number, min = 0): number {
+  if (v === undefined || v === null || v === '') return def;
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n) || n < min) return def;
+  return n;
+}
+
 export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   const c = raw as unknown as QQWorldConfig & Record<string, unknown>;
   for (const [k, v] of Object.entries(QQ_DEFAULTS)) {
@@ -715,6 +785,12 @@ export function normalizeConfig(raw: QQConfigSection): QQWorldConfig {
   if (typeof c.sticker.dir !== 'string') c.sticker.dir = '';
   if (typeof c.sticker.addToQQFavorites !== 'boolean') c.sticker.addToQQFavorites = false;
   if (typeof c.sticker.sharedDir !== 'string' || !c.sticker.sharedDir.trim()) c.sticker.sharedDir = QQ_DEFAULTS.sticker.sharedDir;
+  // 预筛阈值：负数/非数字回默认；0 表示「不限制」，要保留
+  c.sticker.maxKBJpg = numOr(c.sticker.maxKBJpg, QQ_DEFAULTS.sticker.maxKBJpg, 0);
+  c.sticker.maxKBGif = numOr(c.sticker.maxKBGif, QQ_DEFAULTS.sticker.maxKBGif, 0);
+  c.sticker.maxEdge = numOr(c.sticker.maxEdge, QQ_DEFAULTS.sticker.maxEdge, 0);
+  c.sticker.minRatio = numOr(c.sticker.minRatio, QQ_DEFAULTS.sticker.minRatio, 0);
+  c.sticker.maxRatio = numOr(c.sticker.maxRatio, QQ_DEFAULTS.sticker.maxRatio, 0);
   // proactive 子对象原地合并
   c.proactive = c.proactive ?? {};
   Object.assign(c.proactive, { ...QQ_DEFAULTS.proactive, ...(c.proactive as object) });

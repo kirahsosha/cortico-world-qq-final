@@ -104,6 +104,8 @@ export class QQWorld implements World {
   private readonly knownMessages = new Map<string, { conv: string; ts: number }>();
   /** 最近收到的图片 URL 缓冲（供 qq_view_image 主动重看，无需事件里带 URL）。 */
   private readonly recentImages: Array<{ url: string; conv: string; at: number }> = [];
+  /** 上一条消息「被引用」的那条里带的图；qq_sticker_save 不传 url 时优先用它。 */
+  private quotedImage: { url: string; at: number } | null = null;
   private vision: Vision;
   private stickers: StickerStore | null = null;
   private proactive: ProactiveSpeaker | null = null;
@@ -423,6 +425,23 @@ export class QQWorld implements World {
       (name) => this.resolveSecret(name) ?? '',
       (usage, model) => this.host?.reportUsage(usage, { model, label: '表情包标注' }),
       (bytes, ext) => this.pushStickerToQQFavorites(bytes, ext),
+      // TODO-11 2d：表情标注与群图视觉共用同一个 resolveHelperModel，避免两套配置分叉
+      () => {
+        const m = this.resolveHelperModel(this.config.vision, '表情包标注');
+        return m.ok ? { endpoint: m.endpoint, apiKey: m.apiKey, model: m.model } : null;
+      },
+    );
+    // TODO-11 第 4 步：标注前的尺寸/体积预筛阈值（面板「表情包」组可改，改完重启本世界生效）
+    this.stickers.setLimits({
+      maxKBJpg: this.config.sticker.maxKBJpg,
+      maxKBGif: this.config.sticker.maxKBGif,
+      maxEdge: this.config.sticker.maxEdge,
+      minRatio: this.config.sticker.minRatio,
+      maxRatio: this.config.sticker.maxRatio,
+    });
+    this.log.info(
+      `表情包预筛阈值 maxKBJpg=${this.config.sticker.maxKBJpg} maxKBGif=${this.config.sticker.maxKBGif} ` +
+        `maxEdge=${this.config.sticker.maxEdge} ratio=${this.config.sticker.minRatio}~${this.config.sticker.maxRatio}`,
     );
     this.syncConfigRoster();
     this.driver = this.createDriver();
@@ -1362,6 +1381,7 @@ export class QQWorld implements World {
 
     // 引用回复
     conv.quotedSenderId = undefined; // 每条消息重新判定，避免沿用上一条旧引用
+    this.quotedImage = null; // 同上：被引用消息里的图，逐条重置
     const atTargets = segs.filter((s) => s.type === 'at').map((s) => Number((s as { data: { qq: number | string } }).data.qq)).filter((q) => q && q !== selfId);
     conv.lastAtUserId = atTargets[0]; // 触发消息里的 @ 目标，供禁言等管理工具兜底
     let replyText: string | undefined;
@@ -1373,6 +1393,7 @@ export class QQWorld implements World {
       replyRef = q.ref;
       replyText = q.text || undefined;
       if (q.userId) conv.quotedSenderId = q.userId;
+      if (q.imageUrl) this.quotedImage = { url: q.imageUrl, at: Date.now() };
     }
 
     let text = renderIncoming(segs, { timezone: this.config.timezone, selfId, replyText, replyRef });
@@ -1445,7 +1466,7 @@ export class QQWorld implements World {
             const descP = Promise.resolve(this.vision.register(url, Date.now() + 60_000));
             const desc = await Promise.race([
               descP,
-              new Promise<string | null>((res) => setTimeout(() => res(null), 2_500)),
+              new Promise<string | null>((res) => setTimeout(() => res(null), Number((this.config.vision as unknown as { inlineWaitMs?: unknown }).inlineWaitMs ?? 12_000) || 12_000)),
             ]);
             if (desc) {
               if (text) text += '\n';
@@ -1463,7 +1484,8 @@ export class QQWorld implements World {
           const isStickerLike = sd.subType === 'sticker' || /\[?(动画)?表情|贴纸|sticker|emoji/i.test(summary);
           const asSticker = isStickerLike || this.config.sticker.captureMode === 'allImages';
           if (asSticker && !this.host?.isPaused?.()) {
-            this.stickers.ingest(url, conv.address, summary);
+            // 带表情标记的跳过尺寸/体积预筛（动画贴纸可能 2MB+），普通图片走预筛省钱
+            this.stickers.ingest(url, conv.address, summary, { force: isStickerLike });
           }
         }
       } else if (s.type === 'sticker' && (s.data as { url?: string }).url) {
@@ -1472,7 +1494,7 @@ export class QQWorld implements World {
           const url = (s.data as { url: string }).url!;
           const sd = s.data as { subType?: string; summary?: string };
           const summary = typeof sd.summary === 'string' ? sd.summary : '';
-          if (!this.host?.isPaused?.()) this.stickers.ingest(url, conv.address, summary);
+          if (!this.host?.isPaused?.()) this.stickers.ingest(url, conv.address, summary, { force: true });
         }
       } else if (s.type === 'record') {
         const url = (s.data as { url?: string }).url;
@@ -1625,7 +1647,7 @@ export class QQWorld implements World {
   }
 
   /** 实时拉取被引用消息（对齐 fat-fish get_quoted_message 的 get_msg 路径）。 */
-  private async resolveQuoted(rid: number): Promise<{ text?: string; ref?: string; userId?: number }> {
+  private async resolveQuoted(rid: number): Promise<{ text?: string; ref?: string; userId?: number; imageUrl?: string }> {
     if (!this.driver) return {};
     try {
       const r: any = await this.driver.callApi('get_msg', { message_id: rid });
@@ -1634,11 +1656,31 @@ export class QQWorld implements World {
       const userId = sender.user_id != null ? Number(sender.user_id) : undefined;
       const ref = sender.nickname || (userId != null ? String(userId) : undefined);
       const text = renderIncoming(r.message, { timezone: this.config.timezone, selfId: 0 });
-      return { text: text || '', ref, userId };
+      // 被引用的那条消息里如果带图，把它的 url 一起带出来：
+      // 「引用一张图 + 把这张收进表情库」时，要收的是被引用那张，而不是缓冲区里最新那张。
+      const imageUrl = this.firstImageUrlOf(r.message);
+      return { text: text || '', ref, userId, imageUrl };
     } catch (e) {
       this.log.warn('获取引用消息失败', { err: String(e), rid });
       return {};
     }
+  }
+
+  /** 从 OneBot 消息（段数组或 CQ 字符串）里取第一张图的 url。 */
+  private firstImageUrlOf(message: unknown): string | undefined {
+    const segs = Array.isArray(message) ? message : [];
+    for (const s of segs as Array<{ type?: string; data?: { url?: unknown } }>) {
+      if ((s?.type === 'image' || s?.type === 'sticker') && typeof s.data?.url === 'string' && s.data.url) {
+        return s.data.url;
+      }
+    }
+    // 部分协议端把 url 藏在 file 里（形如 http…）
+    for (const s of segs as Array<{ type?: string; data?: { file?: unknown } }>) {
+      if ((s?.type === 'image' || s?.type === 'sticker') && typeof s.data?.file === 'string' && /^https?:\/\//i.test(s.data.file)) {
+        return s.data.file;
+      }
+    }
+    return undefined;
   }
 
   private async handleNotice(ev: OneBotMessage): Promise<void> {
@@ -1977,11 +2019,27 @@ export class QQWorld implements World {
     this.botStreak.set(address, (this.botStreak.get(address) ?? 0) + 1);
   }
 
+  /**
+   * 发送前硬校验表情包标记：一条回复最多带一个，多的丢掉，并且把它移到句末。
+   * 模型经常一次塞三四个 [表情包:xxx]，既刷屏又容易被当成刷表情；这里直接在发送口兜住。
+   */
+  private clampStickerMarks(text: string): string {
+    const re = /\[表情包:[^\]\n]{1,80}\]/g;
+    const all = text.match(re) ?? [];
+    if (all.length <= 1) return text;
+    const first = all[0];
+    const stripped = text.replace(re, '').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    this.log.info('发送前裁剪多余表情包标记', { had: all.length, kept: first });
+    return `${stripped}${stripped ? ' ' : ''}${first}`;
+  }
+
   private async sendTo(address: string, text: string, replyMessageId?: number, atQQs?: number[]): Promise<string> {
     if (!this.driver) return '未连接到 NapCat。';
     // 模型(尤其 DeepSeek)常在回复里把换行写成字面 "\n"(反斜杠+字母n 两字符)。
     // OneBot 会原样发到 QQ 显示成字符,故这里归一化为真实换行符。
     text = text.replace(/\\n/g, '\n');
+    // 表情包标记硬校验：最多一个，且放句末
+    text = this.clampStickerMarks(text);
     const norm = text.replace(/\s+/g, ' ').trim();
     const prev = this.dedupSends.get(address);
     if (prev && prev.norm === norm && Date.now() - prev.ts < 6000) {
@@ -3008,6 +3066,90 @@ export class QQWorld implements World {
       },
     };
 
+    const stickerSave: ToolDef = {
+      name: 'qq_sticker_save',
+      tags: ['write'],
+      barrierAfter: true,
+      description:
+        '手动把一张图收进表情包库：绕过节流与尺寸预筛，但**仍然要先过视觉判定**——被判定为「不是表情包」（截图/照片/商品图等）就不收。\n' +
+        '用途：自动判定漏掉了你想要的图，或你想立刻把刚收到的那张收进库。\n' +
+        '默认：如果你是**引用一张图**在说（如引用一张图说「把这张/刚才那张收进库」），收的是**被引用那张**；否则取最近收到的一张。也可传 url 指定。\n' +
+        '收成功后返回文件名与标注，之后就能用 [表情包:文件名] 发出去。',
+      parameters: {
+        type: 'object',
+        properties: {
+          index: { type: 'number', description: '可选：取最近图片缓冲里的第几条（从 0 起，0 是最早的一条；默认最后一条＝最近）。' },
+          url: { type: 'string', description: '可选：要收录的图片链接；留空则用最近收到的一张。' },
+          label: { type: 'string', description: '可选：给这张图起的显示短名（缺省用短标签）。' },
+        },
+        required: [],
+      },
+      handler: async (args) => {
+        this.log.info('调用 qq_sticker_save');
+        if (!this.config.sticker.enabled) return '表情包收藏未开启（worlds.qqbot.sticker.enabled），无法收录。';
+        if (!this.stickers) return '表情包收藏未启用，无法收录。';
+        let url = typeof args.url === 'string' && args.url.trim() ? args.url.trim() : '';
+        if (!url && this.quotedImage && Date.now() - this.quotedImage.at < 10 * 60_000) {
+          // 用户是「引用一张图」说「把这张/刚才那张收进库」：收被引用那张，别收缓冲区里更新的那张
+          url = this.quotedImage.url;
+          this.log.info(`qq_sticker_save 采用被引用消息里的图 url=${url.slice(0, 80)}`);
+        }
+        if (!url) {
+          const idx = typeof args.index === 'number' && Number.isFinite(args.index) ? args.index : this.recentImages.length - 1;
+          const rec = this.recentImages[idx];
+          if (!rec) return '还没有收到过任何图片，没有可收录的对象；也可以传 url 指定一张。';
+          url = rec.url;
+          this.log.info(`qq_sticker_save 采用最近图片缓冲 index=${idx}/${this.recentImages.length} url=${url.slice(0, 80)}`);
+        }
+        const r = await this.stickers.saveNow(url, 'manual:save', '', { force: true });
+        // 手动收录的结果落一行日志，便于事后在 core.log 核对（工具返回值只回到模型）。
+        // INFO 级别不打印第二参数，所以字段拼进正文。
+        this.log.info(`qq_sticker_save 结果 status=${r.status} file=${r.file || '-'} emotion=${r.emotion || '-'} tag=${r.tag || '-'} reason=${r.reason || '-'}`);
+        if (r.status === 'existing') return `这张图早就在库里（内容去重命中）：[表情包:${r.file}]（情感:${r.emotion}）`;
+        if (r.status === 'stored') {
+          const want = typeof args.label === 'string' && args.label.trim() ? args.label.trim() : '';
+          if (want && r.meta) this.stickers.updateMeta(r.meta.file, { label: want });
+          const tagTxt = r.tag ? ` / 标签:${r.tag}` : '';
+          const usageTxt = r.usage ? ` / 用处:${r.usage}` : '';
+          return `已收录：[表情包:${r.file}]（情感:${r.emotion}${tagTxt}${usageTxt}）`;
+        }
+        if (r.status === 'rejected') {
+          const why = r.reason === 'vision-disabled' || r.reason === 'vision-unavailable'
+            ? '视觉不可用（模型地址/密钥名/模型名没配好或取不到密钥）'
+            : `视觉判定不是表情包（${r.reason || 'not-sticker'}）`;
+          return `没有收录：${why}。`;
+        }
+        if (r.status === 'skipped') return `没有收录：${r.reason || '被跳过'}。`;
+        return `收录失败：${r.reason || '未知错误'}。`;
+      },
+    };
+
+    const stickerDelete: ToolDef = {
+      name: 'qq_sticker_delete',
+      tags: ['write', 'read'],
+      barrierAfter: true,
+      description:
+        '把一张表情包从库里删掉：删本地图片文件 + 从索引移除。\n' +
+        '注意：已经同步到 QQ「收藏表情」的那一份**不会**被撤回（协议端没有删除接口），要清得自己在 QQ 客户端里手动删。\n' +
+        '先调 qq_sticker_stats 拿到真实文件名；文件名也接受 [表情包:sticker-xxxx.jpg] 写法。',
+      parameters: {
+        type: 'object',
+        properties: { file: { type: 'string', description: '要删除的表情包文件名（来自 qq_sticker_stats），如 sticker-abc123.jpg。' } },
+        required: ['file'],
+      },
+      handler: async (args) => {
+        this.log.info('调用 qq_sticker_delete');
+        if (!this.stickers) return '表情包收藏未启用，无法删除。';
+        const file = typeof args.file === 'string' ? args.file.trim() : '';
+        if (!file) return '请指定要删除的文件名（可先调 qq_sticker_stats 查询）。';
+        const r = this.stickers.remove(file);
+        this.log.info(`qq_sticker_delete 结果 ok=${r.ok} file=${r.file} deletedFile=${r.deletedFile} removedFromIndex=${r.removedFromIndex}`);
+        if (!r.ok) return `没有找到表情包「${file}」，请先用 qq_sticker_stats 查看真实文件名。`;
+        return `已删除 [表情包:${r.file}]（${r.deletedFile ? '图片文件已删除' : '图片文件本就不存在'}，索引已移除）。` +
+          '已推送到 QQ 收藏表情的那一份不会被撤回，需要你在 QQ 里手动删。';
+      },
+    };
+
     const memberProfileTool: ToolDef = {
       name: 'qq_member_profile',
       tags: ['read'],
@@ -3032,7 +3174,7 @@ export class QQWorld implements World {
      * 组装所有工具。
      */
 
-    const tools: ToolDef[] = [forwardById, send, confirm, viewImage, stickerStats, stickerToFavorites, stickerTag, memberProfileTool, proactiveTool, qzoneTool, poke, reminderTool, adminTool, ...makeHistoryTools({
+    const tools: ToolDef[] = [forwardById, send, confirm, viewImage, stickerStats, stickerToFavorites, stickerTag, stickerSave, stickerDelete, memberProfileTool, proactiveTool, qzoneTool, poke, reminderTool, adminTool, ...makeHistoryTools({
       getHost: () => this.host,
       sourceId: SOURCE,
       timezone: this.config.timezone,
@@ -3129,6 +3271,7 @@ export class QQWorld implements World {
             { name: 'qq.activePrivates', description: '正在监听的私聊列表。', multiline: true },
             { name: 'qq.unread', description: '未读摘要。' },
             { name: 'qq.memberBrief', description: '群友档案速查：发言量靠前的人及其口头禅，供参考、不必刻意提起。', multiline: true },
+            { name: 'qq.stickerBrief', description: '可用表情包清单：随机抽 8 张，带文件名与情感标注，供 bot 直接引用发送；空库时为空。', multiline: true },
             { name: 'qq.now', description: '当前时间（时区见配置），用于回答"现在几点/星期几/几号"等问题。' },
             { name: 'qq.festival', description: '今天是什么日子：公历/农历节日、二十四节气（按配置时区推算），用于让主动说话自然呼应今天；可能为空（平日无节日）。', multiline: true },
             { name: 'qq.voice', description: '语音能力说明：对方明确要求语音时回复会被转成语音消息，且那正是你自己说的，别误认成对方发的、也别以为没发出去。', multiline: true },
@@ -3374,6 +3517,7 @@ export class QQWorld implements World {
       'qq.activePrivates': privLines,
       'qq.unread': this.unreadSummary(),
       'qq.memberBrief': this.memberBrief(),
+      'qq.stickerBrief': this.stickerBrief(8),
       'qq.now': `当前时间：${nowStr}（时区 ${this.config.timezone}）。若用户问「现在几点」「今天星期几」「几号了」等，据此回答，不要乱编。`,
       'qq.festival': festivalLine,
       'qq.qzone': qzoneLine,
@@ -3386,6 +3530,20 @@ export class QQWorld implements World {
 
   /** 群友档案速查：读 /data/home/companion/data/members/index.json + 每人 llm.summary，8 人约 400 字。 */
   private memberBriefLogged = false;
+
+  /**
+   * 可用表情包速查：从库里随机抽 n 张，渲染成 `[表情包:文件名]（情感）`。
+   * 供 qq.stickerBrief 注入 system 前缀，让模型知道「有哪些图可用」，而不是自己编文件名。
+   * 空库或未开启时返回空串（ENV_PROMPT 里那一段就自然消失）。
+   */
+  private stickerBrief(n = 8): string {
+    if (!this.stickers || !this.config.sticker.enabled) return '';
+    const picked = this.stickers.sample(n);
+    if (!picked.length) return '';
+    const items = picked.map((m) => `[表情包:${m.file}]（${m.emotion || '未知'}）`).join(' ');
+    return `可用表情包（把标记放句末）：\n${items}`;
+  }
+
   private memberBrief(): string {
     try {
       const dir = '/data/home/companion/data/members';

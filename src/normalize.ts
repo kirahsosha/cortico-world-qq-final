@@ -1,5 +1,5 @@
 import { nowIso, shortTime } from 'cortico/core/util.ts';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { faceName, faceIdByName } from './qface-map.ts';
 import type { OneBotSegment } from './types.ts';
@@ -174,7 +174,18 @@ export function buildOutgoing(text: string, emojiDir = ''): OneBotSegment[] {
         const fname = inner.slice('表情包:'.length).trim();
         if (emojiDir && fname) {
           const p = resolveEmojiFile(emojiDir, fname);
-          if (p && existsSync(p)) segments.push({ type: 'image', data: { file: p } });
+          if (p && existsSync(p)) {
+            // 协议端（NapCat）只挂载了 /shared，读不到 /data 下的表情包目录，
+            // 传绝对路径会报「文件处理失败: 识别URL失败」。这里与 voice.ts 同款做法：
+            // 直接 base64:// 内联，不依赖协议端读本机磁盘。
+            // 超大文件（>6MB）宁可丢这个标记，也不要撑爆一次 WS 帧。
+            try {
+              const buf = readFileSync(p);
+              if (buf.byteLength <= 6 * 1024 * 1024) {
+                segments.push({ type: 'image', data: { file: `base64://${buf.toString('base64')}` } });
+              }
+            } catch { /* 读不到就当这个标记不存在 */ }
+          }
         }
         // 目录未配置 / 文件缺失 / 路径越界：丢弃该标记（不入群消息里的可读文本）
       } else if (/^表情\s*\d+(?:[:：][^\]]*)?$/.test(inner)) {
